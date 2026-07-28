@@ -7,9 +7,10 @@ use parking_lot::Mutex;
 use reqwest::header::HeaderMap;
 use rmcp::ErrorData;
 use rmcp::model::{
-    ClientCapabilities, Extensions, GetPromptRequestParams, GetPromptResult, Implementation,
-    ListPromptsResult, ListResourcesResult, PromptMessage, PromptsCapability, ReadResourceResult,
-    ResourcesCapability, Role, ToolsCapability,
+    CallToolResponse, ClientCapabilities, Extensions, GetPromptRequestParams, GetPromptResponse,
+    GetPromptResult, Implementation, ListPromptsResult, ListResourcesResult, PromptMessage,
+    PromptsCapability, ReadResourceResponse, ReadResourceResult, ResourcesCapability, Role,
+    ToolsCapability,
 };
 use rmcp::{
     Peer, RoleServer, ServerHandler, ServiceError,
@@ -289,10 +290,8 @@ impl Running {
             let app = self.apps.iter().find(|app| app.name == app_name);
 
             match app {
-                Some(app) => ListToolsResult {
-                    next_cursor: None,
-                    tools: self
-                        .operations
+                Some(app) => ListToolsResult::with_all_items(
+                    self.operations
                         .read()
                         .await
                         .iter()
@@ -311,8 +310,7 @@ impl Running {
                                 .collect::<Vec<_>>(),
                         )
                         .collect(),
-                    meta: None,
-                },
+                ),
                 None => {
                     return Err(McpError::new(
                         ErrorCode::INVALID_REQUEST,
@@ -322,10 +320,8 @@ impl Running {
                 }
             }
         } else {
-            ListToolsResult {
-                next_cursor: None,
-                tools: self
-                    .operations
+            ListToolsResult::with_all_items(
+                self.operations
                     .read()
                     .await
                     .iter()
@@ -336,8 +332,7 @@ impl Running {
                     .chain(self.explorer_tool.as_ref().iter().map(|e| e.tool.clone()))
                     .chain(self.validate_tool.as_ref().iter().map(|e| e.tool.clone()))
                     .collect(),
-                meta: None,
-            }
+            )
         };
 
         if !self.client_supports_output_schema(protocol_version) {
@@ -527,11 +522,7 @@ impl Running {
             vec![]
         };
 
-        Ok(ListResourcesResult {
-            resources,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(resources))
     }
 
     async fn read_resource_impl(
@@ -649,7 +640,7 @@ impl ServerHandler for Running {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let span = tracing::Span::current();
         if let Some(args) = &request.arguments
             && let Ok(json) = serde_json::to_string(args)
@@ -674,7 +665,7 @@ impl ServerHandler for Running {
             }
         }
 
-        result
+        result.map(Into::into)
     }
 
     #[tracing::instrument(skip_all, parent = get_parent_span(&context))]
@@ -705,12 +696,13 @@ impl ServerHandler for Running {
         &self,
         request: rmcp::model::ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         let peer_info = context.peer.peer_info();
         let client_capabilities = peer_info.as_ref().map(|info| &info.capabilities);
 
         self.read_resource_impl(request, context.extensions, client_capabilities)
             .await
+            .map(Into::into)
     }
 
     #[tracing::instrument(skip_all)]
@@ -727,8 +719,8 @@ impl ServerHandler for Running {
         &self,
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
-        self.get_prompt_impl(request)
+    ) -> Result<GetPromptResponse, McpError> {
+        self.get_prompt_impl(request).map(Into::into)
     }
 
     // `logging` is deprecated by SEP-2577, but we still override this handler so
@@ -2567,7 +2559,7 @@ mod integration_tests {
             StreamableHttpService::new(
                 move || Ok(running.clone()),
                 session_manager,
-                StreamableHttpServerConfig::default().with_stateful_mode(true),
+                StreamableHttpServerConfig::default().with_legacy_session_mode(true),
             )
         }
 
@@ -2897,7 +2889,7 @@ mod integration_tests {
             StreamableHttpService::new(
                 move || Ok(running.clone()),
                 session_manager,
-                StreamableHttpServerConfig::default().with_stateful_mode(true),
+                StreamableHttpServerConfig::default().with_legacy_session_mode(true),
             )
         }
 
@@ -3129,7 +3121,7 @@ mod integration_tests {
             StreamableHttpService::new(
                 move || Ok(running.clone()),
                 LocalSessionManager::default().into(),
-                StreamableHttpServerConfig::default().with_stateful_mode(stateful_mode),
+                StreamableHttpServerConfig::default().with_legacy_session_mode(stateful_mode),
             )
         }
 
@@ -3140,7 +3132,7 @@ mod integration_tests {
             StreamableHttpService::new(
                 move || Ok(running.clone()),
                 session_manager,
-                StreamableHttpServerConfig::default().with_stateful_mode(true),
+                StreamableHttpServerConfig::default().with_legacy_session_mode(true),
             )
         }
 
@@ -3449,7 +3441,7 @@ mod integration_tests {
             StreamableHttpService::new(
                 move || Ok(running.clone()),
                 session_manager,
-                StreamableHttpServerConfig::default().with_stateful_mode(true),
+                StreamableHttpServerConfig::default().with_legacy_session_mode(true),
             )
         }
 
@@ -3607,7 +3599,7 @@ mod integration_tests {
             StreamableHttpService::new(
                 move || Ok(running.clone()),
                 session_manager,
-                StreamableHttpServerConfig::default().with_stateful_mode(true),
+                StreamableHttpServerConfig::default().with_legacy_session_mode(true),
             )
         }
 
