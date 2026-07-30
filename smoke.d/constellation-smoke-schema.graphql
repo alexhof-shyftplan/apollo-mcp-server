@@ -1,0 +1,21 @@
+# Minimal offline schema for the AIR-397 serve-smoke. Mirrors the domain of the
+# shared golden dry-run corpus (User/Contact); the smoke only reads tool
+# descriptions, so the schema just needs to boot the server locally.
+type Query {
+  user: User
+  contact: Contact
+}
+
+type User {
+  id: ID
+  name: String
+  email: String
+  phone: String
+}
+
+type Contact {
+  id: ID
+  payroll: String
+  region: String
+  summary: String
+}
