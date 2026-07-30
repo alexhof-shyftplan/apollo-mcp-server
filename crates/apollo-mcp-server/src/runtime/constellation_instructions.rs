@@ -34,8 +34,7 @@ fn repo_root() -> PathBuf {
 
 fn config_source() -> String {
     let path = repo_root().join(CONFIG_PATH);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 fn config() -> Config {
@@ -66,8 +65,7 @@ fn json_blocks(text: &str) -> Vec<Value> {
         let after = &rest[start + "```json".len()..];
         let end = after.find("```").expect("unterminated ```json block");
         blocks.push(
-            serde_json::from_str(&after[..end])
-                .expect("embedded JSON example must parse as JSON"),
+            serde_json::from_str(&after[..end]).expect("embedded JSON example must parse as JSON"),
         );
         rest = &after[end + 3..];
     }
@@ -226,7 +224,10 @@ fn described_denial_shape_is_the_runtime_output_verbatim() {
         .as_str()
         .expect("golden case carries a denialContext token");
     assert!(token.starts_with("v0."));
-    assert!(hint.contains(token), "denialContext token must appear verbatim");
+    assert!(
+        hint.contains(token),
+        "denialContext token must appear verbatim"
+    );
 
     let request_id = decided["requestId"].as_str().expect("requestId present");
     assert_eq!(request_id.len(), 26, "requestId is a 26-char ULID");
