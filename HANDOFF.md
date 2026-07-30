@@ -1,73 +1,55 @@
 # AIR-399 HANDOFF — search-quality baseline
 
-## Status
+## What landed on `fable/AIR-399` (all green in-container)
 
-All source artifacts for the search-quality baseline are implemented and on
-`fable/AIR-399`:
+- **Offline catalog fixture** —
+  `crates/apollo-mcp-server/src/introspection/tools/testdata/search_baseline/catalog.graphql`:
+  a representative schema with service-prefixed domains (`Billing_`, `Inventory_`,
+  `Shipping_`, `Support_`, `Accounts_`) plus unprefixed core types.
+- **Captured baseline** — `.../search_baseline/baseline.json`: 14 queries → expected
+  top-5 results (`top_paths` = ranked root paths from the index; `result_types` = type
+  definitions the MCP `search` tool returns). Captured in-container by running today's
+  search, not hand-authored. Coverage: 4 unscoped, 5 scoped, 5 known-hard
+  (short natural-language vs prefixed names).
+- **CI parity gate** — `.../tools/search_baseline.rs`:
+  `baseline_reproduces_todays_search` and `baseline_covers_required_query_classes` run
+  in the normal `cargo test` suite (green; verified deterministic across 4 consecutive
+  runs). `capture_search_baseline` (`#[ignore]`) regenerates the fixture.
+- **Offline serve-smoke** — `smoke.d/AIR-399.sh` + `smoke.d/check_search_baseline.py`:
+  boots the real server (streamable HTTP, offline catalog, search tool only), replays
+  all 14 baseline queries over MCP, asserts fixture reproduction.
+  Result in-container: **16/16 checks passed** via
+  `bash /work/harness/smoke.sh /work/AIR-399/apollo-mcp-server/smoke.d/AIR-399.sh`.
+- Full `cargo test -p apollo-mcp-server --lib`: 608 passed, 0 failed.
 
-- `crates/apollo-mcp-server/src/introspection/tools/testdata/search_baseline/catalog.graphql`
-  — offline catalog fixture (service-prefixed domains + unprefixed core types).
-- `crates/apollo-mcp-server/src/introspection/tools/search_baseline.rs` — capture +
-  verify test module: `capture_search_baseline` (ignored; regenerates the fixture) and
-  `baseline_reproduces_todays_search` / `baseline_covers_required_query_classes`
-  (the CI parity gate, runs in the normal `cargo test` suite).
-- `smoke.d/AIR-399.sh` + `smoke.d/check_search_baseline.py` — offline serve-smoke:
-  boots the server (streamable HTTP, search tool only, offline catalog), replays every
-  baseline query through the real MCP endpoint, asserts fixture reproduction.
+## Human actions
 
-## ⚠️ Pending: baseline.json capture (blocked in-container by disk exhaustion)
-
-The container's 98G disk sat at **0 bytes free** for the entire run (≥27G is stale
-`target/` caches from earlier completed stories: `/work/AIR-389b`, `/work/AIR-392`,
-`/work/AIR-393`; two live stories then raced for the remaining blocks). The workspace
-build ratcheted to ~1.4G of artifacts but `apollo-federation` could never complete, so
-`baseline.json` could not be captured here. The fixture is intentionally absent rather
-than hand-authored — hand-authoring would defeat the point of the baseline.
-
-**To finish (any machine with ~3G free disk):**
-
-```sh
-git checkout fable/AIR-399
-# 1. Capture the baseline from today's search (writes testdata/search_baseline/baseline.json)
-cargo test -p apollo-mcp-server capture_search_baseline -- --ignored
-# 2. Verify the parity gate is green and deterministic (run it a few times)
-cargo test -p apollo-mcp-server search_baseline
-cargo test -p apollo-mcp-server search_baseline
-# 3. Offline serve-smoke: boot the real server and reproduce the fixtures end-to-end
-bash /work/harness/smoke.sh /work/AIR-399/apollo-mcp-server/smoke.d/AIR-399.sh
-# 4. Commit the captured fixture
-git add crates/apollo-mcp-server/src/introspection/tools/testdata/search_baseline/baseline.json
-git commit -m "AIR-399: captured search baseline fixture"
-git push origin fable/AIR-399
-```
-
-Verify: step 2 passes (twice, proving determinism); step 3 prints
-`PASS <query-id>` for all queries and `RESULT: PASS`.
-
-## Human actions after the branch is green
-
-1. **PR & merge** `fable/AIR-399` → main. The parity test then runs in CI on every PR;
-   a diff to `baseline.json` is a reviewable search-quality change.
+1. **PR & merge** `fable/AIR-399` → `main`. The parity gate then runs in CI on every
+   PR; any diff to `baseline.json` is a reviewable search-quality change.
+   Verify: CI `cargo test` includes `search_baseline` tests and is green.
 2. **Bare-name smoke invocation** (optional): `bash /work/harness/smoke.sh AIR-399`
    requires the profile inside the harness' read-only `smoke.d/`; copy or symlink
-   `smoke.d/AIR-399.sh` there, or keep using the explicit-path invocation above.
-3. **Container hygiene** (infra): remove stale caches of finished stories
-   (`/work/AIR-389b/router-constellation/target` alone is 14G). This is what blocked
-   the in-container capture.
-4. **Deferred decision — production catalog re-capture**: this baseline is captured
-   over the checked-in offline catalog fixture (the only option in a credential-stripped
-   container, and the only way CI can replay it hermetically). If S2.5 parity should
+   `smoke.d/AIR-399.sh` there. The explicit-path invocation above works as-is.
+3. **Deferred decision — production-catalog re-capture**: this baseline is captured
+   over the checked-in offline catalog fixture (the only hermetic option in a
+   credential-stripped container, and what CI can replay). If S2.5 parity should
    *additionally* be measured against the live production catalog, capture a second
-   fixture set with `schema.source: uplink` + real `APOLLO_GRAPH_REF`/`APOLLO_KEY` and
-   the same harness; the test module and smoke need no code changes, only fixtures.
+   fixture set using `schema.source: uplink` with real `APOLLO_GRAPH_REF`/`APOLLO_KEY`;
+   the test module and smoke checker need no code changes, only new fixture files.
+   Verify: rerun the smoke against the new fixtures.
+4. **Toolchain note** (no action strictly required): the container ran clippy 1.95,
+   which flags pre-existing code (`apps/tool.rs`, `env_expansion.rs`,
+   `introspection/tools/validate.rs`) under `--deny warnings`; the repo pins 1.92.0
+   (`rust-toolchain.toml`) where CI is green. AIR-399 files are clippy-clean; the
+   pre-existing lints were deliberately left untouched to keep the diff scoped.
+5. **Container hygiene** (infra, for future runs): this story stalled ~5h on a full
+   `/work` disk; stale `target/` caches of completed stories (e.g. `/work/AIR-389b`,
+   14G) had to be cleared externally before the build could finish. Consider
+   auto-cleaning story workspaces at run end.
 
-## Design notes for S2.5 (the consumer)
+## Notes for S2.5 (the consumer of this baseline)
 
-- `baseline.json` pins per query: `top_paths` (ranked top-5 root paths from the index —
-  the ranking the search tool selects from) and `result_types` (type definitions the MCP
-  `search` tool returns — what a client observes). Discovery search must match or beat
-  these on the same catalog fixture.
-- k = 5 = `MAX_SEARCH_RESULTS` (the search tool's own truncation).
-- Coverage classes are enforced by `baseline_covers_required_query_classes`:
-  ≥3 each of `unscoped`, `scoped`, and `hard` (short natural-language queries against
-  service-prefixed names, e.g. "track my package" → `Shipping_Parcel`).
+- Discovery search must match or beat `top_paths`/`result_types` per query on this
+  same catalog fixture; k = 5 = `MAX_SEARCH_RESULTS` (the search tool's truncation).
+- Capture parameters are pinned in `baseline.json` under `captured_with` and asserted
+  by the parity test, so silent config drift also fails the gate.
