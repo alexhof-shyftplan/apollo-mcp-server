@@ -5,10 +5,14 @@
 # for the removed `constellation` skill) plus a minimal offline boot overlay,
 # then, over the real MCP streamable HTTP endpoint, lists the tools and reads
 # their descriptions, asserting:
-#   - the full access protocol is carried by the descriptions (dry-run batch ->
-#     consolidated request -> poll-for-approval -> single digest-mismatch
-#     retry -> re-dry-run -> deploy), denial grouping, and the accuracy limit,
-#   - the denial-error shape they describe equals the shared golden dry-run
+#   - `execute` is the ONLY tool listed — as of AIR-402 (S2.5) the
+#     search/introspect/validate tools are served by the Discovery service
+#     (constellation-discovery) through the gateway's unified tool list,
+#   - the full access protocol is carried by the execute description (dry-run
+#     batch -> consolidated request -> poll-for-approval -> single
+#     digest-mismatch retry -> re-dry-run -> deploy), denial grouping, and the
+#     accuracy limit,
+#   - the denial-error shape it describes equals the shared golden dry-run
 #     corpus (the runtime's recorded output),
 #   - no `constellation` skill is registered.
 #
@@ -85,9 +89,11 @@ smoke_check() {
   expect "indeterminate decisions stated"         "$out" "PASS proto:accuracy-indeterminate"
   expect "runtime denial safety net"              "$out" "PASS proto:runtime-safety-net"
   expect "agents told to handle runtime denials"  "$out" "PASS proto:handle-runtime-denials"
-  expect "introspect routes to execute protocol"  "$out" "PASS proto:introspect-routes-to-execute"
-  expect "search routes to execute protocol"      "$out" "PASS proto:search-routes-to-execute"
-  expect "validate routes to execute protocol"    "$out" "PASS proto:validate-routes-to-execute"
+  expect "execute tool listed"                    "$out" "PASS tool-registered:execute"
+  expect "introspect absent (Discovery serves it)" "$out" "PASS tool-absent:introspect"
+  expect "search absent (Discovery serves it)"    "$out" "PASS tool-absent:search"
+  expect "validate absent (Discovery serves it)"  "$out" "PASS tool-absent:validate"
+  expect "execute is the only listed tool"        "$out" "PASS tool-list:execute-only"
   expect "described denial shape == runtime out"  "$out" "PASS denial-shape:decided-matches-runtime"
   expect "described error shape == runtime out"   "$out" "PASS denial-shape:errors-matches-runtime"
   expect "denialContext token verbatim"           "$out" "PASS denial-shape:token-verbatim"

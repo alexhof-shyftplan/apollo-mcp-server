@@ -6,6 +6,7 @@ use apollo_compiler::{
     parser::Parser,
     schema::ExtendedType,
 };
+use apollo_schema_index::tree_shake::{DepthLimit, SchemaTreeShaker};
 use http::{HeaderMap, HeaderValue};
 use regex::Regex;
 use rmcp::model::{Tool, ToolAnnotations};
@@ -18,7 +19,6 @@ use crate::{
     custom_scalar_map::CustomScalarMap,
     errors::OperationError,
     graphql::{self, OperationDetails, ValidationError},
-    schema_tree_shake::{DepthLimit, SchemaTreeShaker},
 };
 
 use super::{

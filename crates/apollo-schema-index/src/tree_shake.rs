@@ -95,7 +95,8 @@ struct TreeDirectiveNode<'schema> {
 }
 
 impl<'schema> SchemaTreeShaker<'schema> {
-    pub(crate) fn argument_descriptions(&self) -> &HashMap<String, Vec<String>> {
+    /// Descriptions collected for operation arguments, keyed by operation variable name.
+    pub fn argument_descriptions(&self) -> &HashMap<String, Vec<String>> {
         &self.arguments_descriptions
     }
 
@@ -935,13 +936,32 @@ fn retain_directive(
 
 #[cfg(test)]
 mod test {
-    use apollo_compiler::{ast::OperationType, parser::Parser};
+    use apollo_compiler::{
+        Node,
+        ast::{Definition, Document, OperationDefinition, OperationType},
+        parser::Parser,
+    };
     use rstest::{fixture, rstest};
 
-    use crate::{
-        operations::operation_defs,
-        schema_tree_shake::{DepthLimit, SchemaTreeShaker},
-    };
+    use crate::tree_shake::{DepthLimit, SchemaTreeShaker};
+
+    /// Minimal local stand-in for apollo-mcp-server's `operations::operation_defs`
+    /// (this module was extracted from that crate): parse an operation document
+    /// and return it together with its first operation definition.
+    fn operation_defs(source_text: &str) -> (Document, Node<OperationDefinition>) {
+        let document = Parser::new()
+            .parse_ast(source_text, "operation.graphql")
+            .unwrap();
+        let operation_def = document
+            .definitions
+            .iter()
+            .find_map(|def| match def {
+                Definition::OperationDefinition(operation_def) => Some(operation_def.clone()),
+                _ => None,
+            })
+            .expect("source must contain an operation definition");
+        (document, operation_def)
+    }
 
     #[test]
     fn should_remove_type_mutation_mode_none() {
@@ -1070,13 +1090,7 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
-            "query TestQuery { id }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        let (operation_document, operation_def) = operation_defs("query TestQuery { id }");
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
         assert_eq!(
             shaker.shaken().unwrap().to_string(),
@@ -1307,17 +1321,13 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
+        let (operation_document, operation_def) = operation_defs(
             "query TestQuery($id1: ID, $other: String) { \
                 someQuery(id: $id1, other: $other, otherArg: $other) { \
                     value
                 }
             }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        );
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
 
         let id_description = shaker.arguments_descriptions.get("id1");
@@ -1347,17 +1357,13 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
+        let (operation_document, operation_def) = operation_defs(
             "query TestQuery($id: ID, $other2: String) { \
                 someQuery(id: $id, other: $other2, otherArg: $other2) { \
                     value
                 }
             }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        );
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
 
         let id_description = shaker.arguments_descriptions.get("id");
@@ -1390,18 +1396,14 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
+        let (operation_document, operation_def) = operation_defs(
             "query TestQuery($id: ID, $other: Boolean!) { \
                 someQuery(id: $id, other: $other) { \
                     id
                     value @skip(if: $other)
                 }
             }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        );
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
 
         let description = shaker.arguments_descriptions.get("other");
@@ -1429,18 +1431,14 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
+        let (operation_document, operation_def) = operation_defs(
             "query TestQuery($id: ID, $other: Boolean!) { \
                 someQuery(id: $id, other: $other) { \
                     id
                     value @x(value: $other)
                 }
             }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        );
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
 
         let description = shaker.arguments_descriptions.get("other");
@@ -1473,18 +1471,14 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
+        let (operation_document, operation_def) = operation_defs(
             "query Search { \
                 search { \
                     ... on User { id name } \
                     ... on Post { id title } \
                 }
             }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        );
 
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
 
@@ -1520,7 +1514,7 @@ mod test {
             .unwrap();
         let schema = document.to_schema_validate().unwrap();
         let mut shaker = SchemaTreeShaker::new(&schema);
-        let (operation_document, operation_def, _comments) = operation_defs(
+        let (operation_document, operation_def) = operation_defs(
             "query Search { \
                 search { \
                     ...UserFields \
@@ -1535,11 +1529,7 @@ mod test {
                 id \
                 title \
             }",
-            false,
-            Some("operation.graphql".to_string()),
-        )
-        .unwrap()
-        .unwrap();
+        );
 
         shaker.retain_operation(&operation_def, &operation_document, DepthLimit::Unlimited);
 

@@ -5,7 +5,11 @@ Speaks just enough MCP streamable HTTP to a locally booted apollo-mcp-server
 running the constellation configuration (config/constellation/config.yaml) and
 asserts, over the wire:
 
-  * the tool descriptions carry the full access protocol (anticipate ->
+  * `execute` is the ONLY tool listed — as of AIR-402 (S2.5) the
+    search/introspect/validate tools are served by the Discovery service
+    (constellation-discovery) through the gateway's unified tool list, so
+    this server must not list them,
+  * the `execute` description carries the full access protocol (anticipate ->
     dry-run one batch -> one consolidated access request -> poll-for-approval
     via execute -> single bundle-digest-mismatch retry -> re-dry-run -> deploy),
   * denial grouping (one consolidated interaction per session),
@@ -179,19 +183,27 @@ def main():
     by_name = {tool["name"]: tool.get("description", "") for tool in tools}
     print(f"tools registered: {sorted(by_name)}")
 
-    for tool in ("execute", "introspect", "search", "validate"):
-        check(f"tool-registered:{tool}", tool in by_name)
+    # AIR-402 (S2.5): this server serves `execute` ONLY. The search/
+    # introspect/validate tools moved to the Discovery service
+    # (constellation-discovery) and reach agents through the gateway's
+    # unified tool list, so they must NOT be listed here.
+    check("tool-registered:execute", "execute" in by_name)
+    for tool in ("introspect", "search", "validate"):
+        check(
+            f"tool-absent:{tool}",
+            tool not in by_name,
+            f"{tool} is served by constellation-discovery (AIR-402/S2.5)",
+        )
+    check(
+        "tool-list:execute-only",
+        set(by_name) == {"execute"},
+        f"tools={sorted(by_name)}",
+    )
 
     execute_desc = by_name.get("execute", "")
     execute_flat = flat(execute_desc)
     for key, phrase in EXECUTE_PHRASES:
         check(f"proto:{key}", phrase in execute_flat, f"missing phrase {phrase!r}")
-
-    for tool in ("introspect", "search", "validate"):
-        check(
-            f"proto:{tool}-routes-to-execute",
-            "`execute` tool description" in flat(by_name.get(tool, "")),
-        )
 
     # Denial-error shape described over the wire == the runtime's recorded
     # output (the shared golden dry-run corpus).

@@ -46,6 +46,9 @@ use traverse::SchemaExt;
 pub mod error;
 mod path;
 mod traverse;
+/// GraphQL schema tree shaking. Extracted from apollo-mcp-server (AIR-402) so
+/// that constellation-discovery can reuse it to render search/introspect results.
+pub mod tree_shake;
 
 pub const TYPE_NAME_FIELD: &str = "type_name";
 pub const DESCRIPTION_FIELD: &str = "description";

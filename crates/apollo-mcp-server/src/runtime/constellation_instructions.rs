@@ -7,7 +7,11 @@
 //! supports. These tests pin the artifact:
 //!
 //! * it parses as a valid server [`Config`] (typo'd keys fail here, not at boot),
-//! * the tool descriptions cover the full access protocol (anticipate →
+//! * `execute` is the ONLY tool this server enables in the Constellation
+//!   deployment — as of AIR-402 (S2.5) the `search`/`introspect`/`validate`
+//!   tools are served by the Discovery service (constellation-discovery)
+//!   through the gateway's unified tool list, so they are disabled here,
+//! * the `execute` description covers the full access protocol (anticipate →
 //!   dry-run one batch → one consolidated access request → poll for approval
 //!   via `execute` → re-dry-run → deploy), denial grouping, the single
 //!   bundle-digest-mismatch retry, and the dry-run accuracy limit,
@@ -85,36 +89,59 @@ fn golden_expected(case_name: &str) -> Value {
 }
 
 #[test]
-fn config_is_valid_and_targets_every_agent_facing_tool() {
+fn config_is_valid_and_execute_carries_the_guidance() {
     let config = config();
     assert!(
         config.instructions.is_some(),
         "server-level instructions must be configured"
     );
-    for (tool, hint, enabled) in [
-        (
-            "execute",
-            &config.introspection.execute.hint,
-            config.introspection.execute.enabled,
-        ),
+    assert!(
+        config.introspection.execute.hint.is_some(),
+        "execute tool must carry a description hint"
+    );
+    assert!(
+        config.introspection.execute.enabled,
+        "execute tool must be enabled by this configuration"
+    );
+}
+
+/// AIR-402 (S2.5): in the Constellation deployment, `execute` is the ONLY
+/// tool this server enables. The `search`/`introspect`/`validate` tools are
+/// served by the Discovery service (constellation-discovery) through the
+/// gateway's unified tool list, so this config must disable them (and no
+/// longer carry hints for tools it does not serve).
+#[test]
+fn execute_is_the_only_enabled_tool_in_the_constellation_config() {
+    let config = config();
+    assert!(
+        config.introspection.execute.enabled,
+        "execute must stay enabled: it is the tool this server still serves"
+    );
+    for (tool, enabled, hint) in [
         (
             "introspect",
-            &config.introspection.introspect.hint,
             config.introspection.introspect.enabled,
+            &config.introspection.introspect.hint,
         ),
         (
             "search",
-            &config.introspection.search.hint,
             config.introspection.search.enabled,
+            &config.introspection.search.hint,
         ),
         (
             "validate",
-            &config.introspection.validate.hint,
             config.introspection.validate.enabled,
+            &config.introspection.validate.hint,
         ),
     ] {
-        assert!(hint.is_some(), "{tool} tool must carry a description hint");
-        assert!(enabled, "{tool} tool must be enabled by this configuration");
+        assert!(
+            !enabled,
+            "{tool} must be disabled: it is served by constellation-discovery (AIR-402/S2.5)"
+        );
+        assert!(
+            hint.is_none(),
+            "{tool} must not carry a hint: this server no longer serves it"
+        );
     }
 }
 
@@ -139,22 +166,12 @@ fn descriptions_cover_the_full_access_protocol() {
             "execute description must cover protocol step: {step:?}"
         );
     }
-    // The workflow summary is also server-level guidance, and every other
-    // tool's description points back to the execute tool's full protocol.
+    // The workflow summary is also server-level guidance. (As of AIR-402/S2.5
+    // the search/introspect/validate descriptions that routed back here are
+    // served by constellation-discovery, not by this config.)
     let instructions = flat(&config.instructions.clone().unwrap_or_default());
     assert!(instructions.contains("dry-run"));
     assert!(instructions.contains("one consolidated access request"));
-    for hint in [
-        &config.introspection.introspect.hint,
-        &config.introspection.search.hint,
-        &config.introspection.validate.hint,
-    ] {
-        let hint = flat(hint.as_deref().unwrap_or_default());
-        assert!(
-            hint.contains("`execute` tool description"),
-            "every tool description must route to the full protocol on `execute`"
-        );
-    }
 }
 
 #[test]

@@ -110,28 +110,15 @@ introspection:
       token and stamped on the audit records for that request, so quote it
       when escalating. Treat `requestId` and `denialContext` as opaque strings
       — never construct, edit, or decode-and-reuse them.
+  # AIR-402 (S2.5): the search, introspect, and validate tools are served by
+  # the Discovery service (constellation-discovery) through the gateway's
+  # unified tool list — agents still see all four tools there. In the
+  # Constellation deployment apollo-mcp-server serves `execute` only, so
+  # these three are disabled here (their guidance moved to Discovery along
+  # with the tools).
   introspect:
-    enabled: true
-    hint: |
-      This graph is policy-governed (Constellation): the schema you can
-      introspect is your entitled view, and fields hidden from you do not
-      appear at all. Use introspection to anticipate every operation the app
-      will need, then follow the access workflow in the `execute` tool
-      description (dry-run in one batch, one consolidated access request,
-      poll for approval, re-dry-run, deploy).
+    enabled: false
   search:
-    enabled: true
-    hint: |
-      This graph is policy-governed (Constellation). Use search to discover
-      the types and fields the app will need and anticipate its operations,
-      then follow the access workflow in the `execute` tool description
-      (dry-run in one batch, one consolidated access request, poll for
-      approval, re-dry-run, deploy).
+    enabled: false
   validate:
-    enabled: true
-    hint: |
-      This graph is policy-governed (Constellation). A valid operation can
-      still be denied by policy at runtime: after validating, dry-run the full
-      anticipated operation set in one batch and follow the access workflow in
-      the `execute` tool description. The runtime denial path — not
-      validation, not the dry run — is the final enforcement.
+    enabled: false

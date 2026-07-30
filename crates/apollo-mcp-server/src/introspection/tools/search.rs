@@ -3,10 +3,10 @@
 use crate::errors::McpError;
 use crate::introspection::minify::MinifyExt as _;
 use crate::schema_from_type;
-use crate::schema_tree_shake::{DepthLimit, SchemaTreeShaker};
 use apollo_compiler::ast::{Field, OperationType as AstOperationType, Selection};
 use apollo_compiler::validation::Valid;
 use apollo_compiler::{Name, Node, Schema};
+use apollo_schema_index::tree_shake::{DepthLimit, SchemaTreeShaker};
 use apollo_schema_index::{OperationType, Options, SchemaIndex};
 use rmcp::model::{CallToolResult, ContentBlock, ErrorCode, Tool};
 use rmcp::schemars::JsonSchema;
