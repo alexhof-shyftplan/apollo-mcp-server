@@ -1,0 +1,137 @@
+# Constellation access-workflow guidance — MCP tool descriptions (AIR-397 / S1.10).
+#
+# This file is CONFIGURATION, not code. The agent guidance below reaches models
+# through the MCP protocol itself: the `initialize` response `instructions` and
+# the tool descriptions listed by `tools/list` (via the server's per-tool
+# description `hint` support). It replaces the deprecated `constellation` agent
+# skill: the instructions are no longer compiled into any bundle — edit this
+# file and restart the server to change what agents are told.
+#
+# Usage: layer these keys into the deployment's server config (they are a
+# fragment — transport, endpoint, and schema stay deployment-specific; any
+# APOLLO_MCP_* environment variable still takes precedence).
+#
+# Contract notes:
+# - The denial shapes quoted below are pinned byte-for-byte against the shared
+#   golden dry-run corpus (constellation-policy-eval/fixtures/dry-run-golden.json)
+#   by crates/apollo-mcp-server/src/runtime/constellation_instructions.rs.
+# - Validation against STAGING fixtures (the deployed runtime's live output) is
+#   a human step — see HANDOFF.md.
+
+instructions: |
+  This graph is governed by Constellation access policies: fields you are not
+  entitled to are hidden, masked, or denied at runtime. Before deploying an app
+  against this graph, follow the access workflow in the `execute` tool
+  description: anticipate every operation the app will need, dry-run them all
+  in one batch, submit one consolidated access request for the denials, poll
+  for approval, re-dry-run to confirm, then deploy. Dry-run decisions are
+  advisory; runtime enforcement is the final word.
+
+introspection:
+  execute:
+    enabled: true
+    hint: |
+      Constellation access workflow — this graph is policy-governed. Follow
+      this protocol, in order:
+
+      1. ANTICIPATE: Anticipate the app's operations — enumerate every GraphQL
+         operation the app will run in production (use the `search`,
+         `introspect`, and `validate` tools to discover and check them) BEFORE
+         requesting any access.
+      2. DRY-RUN: dry-run them in one batch. Run the `dry_run` query through
+         this tool with ALL anticipated operations in a single batch:
+         `dry_run(requests: [{scope, operation}, ...])`, where `scope` is the
+         target service id and `operation` is the GraphQL document. Nothing
+         executes during a dry run — no resolver runs and no upstream traffic
+         is sent — so mutations are safe to include.
+      3. REQUEST: submit one consolidated access request. Collect the
+         `denialContext` tokens from every requestable `deny` decision across
+         the entire batch and submit them together in a single access-request
+         mutation. Never submit one request per field or per operation:
+         exactly one consolidated interaction per session, so approvers see
+         the app's complete access picture at once.
+      4. POLL: Poll for approval by periodically re-running the access-request
+         status query through this `execute` tool until the request resolves
+         (approved or denied). There is no callback; polling via `execute` is
+         the mechanism.
+      5. CONFIRM: after approval, re-run the SAME dry-run batch from step 2
+         and confirm every previously denied field now reports `allow`.
+      6. Deploy the app only after the confirming dry run is clean.
+
+      Bundle-digest mismatch (skew contract): if the access-request submission
+      is rejected with a bundle-digest mismatch, the policy bundle changed
+      between your dry run and the submission. Re-run the dry-run batch
+      against the current bundle and resubmit exactly ONCE. If the retry is
+      also rejected with a bundle-digest mismatch, stop and surface the error
+      — do not retry a second time.
+
+      Dry-run accuracy limit: dry-run decisions are point-in-time and advisory,
+      not a guarantee. A field reports `indeterminate` when its governing rule
+      is not statically decidable at dry-run time (for example a time-bounded
+      exception), and policy can change between dry run and execution. The
+      runtime denial path remains the safety net: always handle runtime denial
+      errors, even for operations whose dry run was clean.
+
+      Dry-run response shape — each batch entry returns either per-field
+      decisions:
+
+      ```json
+      {
+        "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "denyOperation": false,
+        "fields": [
+          { "path": "contact", "decision": "allow" },
+          {
+            "path": "contact.payroll",
+            "decision": "deny",
+            "reason": "Request access via the Access Request workflow.",
+            "denialContext": "v0.eyJhcHBfaWQiOiIiLCJwcmluY2lwYWxfaWQiOiJhbGljZSIsInNlcnZpY2VfaWQiOiJzdmMiLCJibG9ja2VkX2ZpZWxkcyI6W3siY29vcmQiOiJDb250YWN0LnBheXJvbGwiLCJjbGFzc2lmaWNhdGlvbiI6InRhZy1yZXF1ZXN0YWJsZSIsInJlYXNvbiI6IlJlcXVlc3QgYWNjZXNzIHZpYSB0aGUgQWNjZXNzIFJlcXVlc3Qgd29ya2Zsb3cuIn1dLCJ0aW1lc3RhbXAiOiIyMDI2LTAxLTAyVDAzOjA0OjA1WiIsInJlcXVlc3RfaWQiOiIwMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsInNjaGVtYV9pZCI6ImRyeS1ydW4tc2NoZW1hLXYxIn0.a2d3de62d2032939a5c08c043611d6b9b77b00a1ac755f8d914ed23d663d23fd"
+          }
+        ]
+      }
+      ```
+
+      where `decision` is one of `allow` | `mask` | `deny` | `indeterminate`
+      (`denyOperation: true` means the whole operation is refused before
+      execution, and a requestable `deny` carries the opaque `denialContext`
+      token to attach to the access request) — or, when the operation does not
+      resolve against your view of the schema (a field you cannot see fails
+      resolution exactly like a nonexistent one), errors only:
+
+      ```json
+      {
+        "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "errors": ["Cannot query field \"ssn\" on type \"Contact\"."]
+      }
+      ```
+
+      Every entry carries a `requestId` (a 26-character uppercase
+      Crockford-base32 ULID). The same id is embedded in any `denialContext`
+      token and stamped on the audit records for that request, so quote it
+      when escalating. Treat `requestId` and `denialContext` as opaque strings
+      — never construct, edit, or decode-and-reuse them.
+  introspect:
+    enabled: true
+    hint: |
+      This graph is policy-governed (Constellation): the schema you can
+      introspect is your entitled view, and fields hidden from you do not
+      appear at all. Use introspection to anticipate every operation the app
+      will need, then follow the access workflow in the `execute` tool
+      description (dry-run in one batch, one consolidated access request,
+      poll for approval, re-dry-run, deploy).
+  search:
+    enabled: true
+    hint: |
+      This graph is policy-governed (Constellation). Use search to discover
+      the types and fields the app will need and anticipate its operations,
+      then follow the access workflow in the `execute` tool description
+      (dry-run in one batch, one consolidated access request, poll for
+      approval, re-dry-run, deploy).
+  validate:
+    enabled: true
+    hint: |
+      This graph is policy-governed (Constellation). A valid operation can
+      still be denied by policy at runtime: after validating, dry-run the full
+      anticipated operation set in one batch and follow the access workflow in
+      the `execute` tool description. The runtime denial path — not
+      validation, not the dry run — is the final enforcement.

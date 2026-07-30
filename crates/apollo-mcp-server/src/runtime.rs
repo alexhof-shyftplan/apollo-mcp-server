@@ -4,6 +4,8 @@
 //! related to runtime configuration.
 
 mod config;
+#[cfg(test)]
+mod constellation_instructions;
 mod endpoint;
 mod filtering_exporter;
 mod graphos;

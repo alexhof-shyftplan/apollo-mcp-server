@@ -1,0 +1,307 @@
+{
+  "meta": {
+    "story": "AIR-395 (requestId: AIR-396)",
+    "description": "Golden dry_run corpus: {scope, operation} batches per principal against fixtures/bundles/dry-run, with byte-exact expected per-field decisions. Shared contract with the Front Door's Stage-2 dry-run tests: the Front Door must reproduce exactly these outputs for these inputs. denialContext tokens are minted with the fixed request_id + timestamp below, so they are byte-exact; their payloads decode via the denial_context v0 format (v0.<base64url(JSON)>.<sha256-hex>). AIR-396: every expected outcome — success or error — carries requestId (a ULID string; here the fixed meta request_id, since run_at injects one id for the whole batch), equal to the request_id inside any denialContext token in that outcome.",
+    "bundle": "bundles/dry-run",
+    "schema_id": "dry-run-schema-v1",
+    "request_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "timestamp": "2026-01-02T03:04:05Z",
+    "scope_note": "scope is the target service id (the evaluator's service_id axis)"
+  },
+  "schema": {
+    "query_type": "Query",
+    "mutation_type": "Mutation",
+    "types": {
+      "Query": {
+        "user": "User",
+        "contact": "Contact",
+        "blocked": "String"
+      },
+      "User": {
+        "id": "ID",
+        "name": "String",
+        "email": "String",
+        "phone": "String"
+      },
+      "Contact": {
+        "id": "ID",
+        "ssn": "String",
+        "payroll": "String",
+        "region": "String",
+        "watched": "String",
+        "summary": "String",
+        "internalNotes": "String"
+      },
+      "Mutation": {
+        "updateEmail": "User",
+        "deleteContact": "Contact"
+      }
+    }
+  },
+  "classifications": {
+    "User.email": ["tag-pii"],
+    "User.phone": ["tag-visible"],
+    "Contact.ssn": ["tag-hidden"],
+    "Contact.payroll": ["tag-requestable"],
+    "Contact.region": ["tag-time"],
+    "Contact.watched": ["tag-shadow"],
+    "Contact.summary": ["tag-narrow"],
+    "Contact.internalNotes": ["tag-narrow"],
+    "Query.blocked": ["tag-opblock"],
+    "Mutation.updateEmail": ["tag-pii"],
+    "Mutation.deleteContact": ["tag-hidden"]
+  },
+  "principals": {
+    "alice": { "principal_id": "alice", "groups": [], "app_id": "" },
+    "bob": { "principal_id": "bob", "groups": ["clearance"], "app_id": "portal" }
+  },
+  "cases": [
+    {
+      "name": "scalars-allow-mask-visible",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ user { id name email phone } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "user", "decision": "allow" },
+            { "path": "user.id", "decision": "allow" },
+            { "path": "user.name", "decision": "allow" },
+            { "path": "user.email", "decision": "mask" },
+            { "path": "user.phone", "decision": "deny", "reason": "Access requires manager approval." }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "requestable-denial-mints-token",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { payroll } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            {
+              "path": "contact.payroll",
+              "decision": "deny",
+              "reason": "Request access via the Access Request workflow.",
+              "denialContext": "v0.eyJhcHBfaWQiOiIiLCJwcmluY2lwYWxfaWQiOiJhbGljZSIsInNlcnZpY2VfaWQiOiJzdmMiLCJibG9ja2VkX2ZpZWxkcyI6W3siY29vcmQiOiJDb250YWN0LnBheXJvbGwiLCJjbGFzc2lmaWNhdGlvbiI6InRhZy1yZXF1ZXN0YWJsZSIsInJlYXNvbiI6IlJlcXVlc3QgYWNjZXNzIHZpYSB0aGUgQWNjZXNzIFJlcXVlc3Qgd29ya2Zsb3cuIn1dLCJ0aW1lc3RhbXAiOiIyMDI2LTAxLTAyVDAzOjA0OjA1WiIsInJlcXVlc3RfaWQiOiIwMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsInNjaGVtYV9pZCI6ImRyeS1ydW4tc2NoZW1hLXYxIn0.a2d3de62d2032939a5c08c043611d6b9b77b00a1ac755f8d914ed23d663d23fd"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "hidden-field-fails-resolution",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { id ssn } }" }
+      ],
+      "expected": [
+        { "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "errors": ["Cannot query field \"ssn\" on type \"Contact\"."] }
+      ]
+    },
+    {
+      "name": "nonexistent-field-fails-identically",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { id sssn } }" }
+      ],
+      "expected": [
+        { "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "errors": ["Cannot query field \"sssn\" on type \"Contact\"."] }
+      ]
+    },
+    {
+      "name": "exception-lifts-hidden-field",
+      "principal": "bob",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { id ssn } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            { "path": "contact.id", "decision": "allow" },
+            { "path": "contact.ssn", "decision": "allow" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "time-governed-rule-is-indeterminate",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { region } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            { "path": "contact.region", "decision": "indeterminate" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "time-governed-rule-is-indeterminate-even-when-excepted",
+      "principal": "bob",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { region } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            { "path": "contact.region", "decision": "indeterminate" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shadow-rule-enforces-nothing",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { watched } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            { "path": "contact.watched", "decision": "allow" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "operation-level-deny-gate",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ blocked }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": true,
+          "fields": [
+            { "path": "blocked", "decision": "allow" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mutation-is-safe-to-dry-run",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "mutation { updateEmail { email } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "updateEmail", "decision": "mask" },
+            { "path": "updateEmail.email", "decision": "mask" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "mutation-hidden-root-field-fails-resolution",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "mutation { deleteContact { id } }" }
+      ],
+      "expected": [
+        { "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "errors": ["Cannot query field \"deleteContact\" on type \"Mutation\"."] }
+      ]
+    },
+    {
+      "name": "alias-and-fragment-resolution",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "query Q { c: contact { ...P } } fragment P on Contact { pay: payroll }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "c", "decision": "allow" },
+            {
+              "path": "c.pay",
+              "decision": "deny",
+              "reason": "Request access via the Access Request workflow.",
+              "denialContext": "v0.eyJhcHBfaWQiOiIiLCJwcmluY2lwYWxfaWQiOiJhbGljZSIsInNlcnZpY2VfaWQiOiJzdmMiLCJibG9ja2VkX2ZpZWxkcyI6W3siY29vcmQiOiJDb250YWN0LnBheXJvbGwiLCJjbGFzc2lmaWNhdGlvbiI6InRhZy1yZXF1ZXN0YWJsZSIsInJlYXNvbiI6IlJlcXVlc3QgYWNjZXNzIHZpYSB0aGUgQWNjZXNzIFJlcXVlc3Qgd29ya2Zsb3cuIn1dLCJ0aW1lc3RhbXAiOiIyMDI2LTAxLTAyVDAzOjA0OjA1WiIsInJlcXVlc3RfaWQiOiIwMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsInNjaGVtYV9pZCI6ImRyeS1ydW4tc2NoZW1hLXYxIn0.a2d3de62d2032939a5c08c043611d6b9b77b00a1ac755f8d914ed23d663d23fd"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "field-filter-narrows-allow",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ contact { summary internalNotes } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            { "path": "contact.summary", "decision": "allow" },
+            { "path": "contact.internalNotes", "decision": "deny", "reason": "field on redact_fields" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "batch-preserves-request-order",
+      "principal": "alice",
+      "requests": [
+        { "scope": "svc", "operation": "{ user { id } }" },
+        { "scope": "svc", "operation": "{ user { " },
+        { "scope": "svc", "operation": "{ contact { payroll } }" }
+      ],
+      "expected": [
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "user", "decision": "allow" },
+            { "path": "user.id", "decision": "allow" }
+          ]
+        },
+        { "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "errors": ["Failed to parse operation document."] },
+        {
+          "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          "denyOperation": false,
+          "fields": [
+            { "path": "contact", "decision": "allow" },
+            {
+              "path": "contact.payroll",
+              "decision": "deny",
+              "reason": "Request access via the Access Request workflow.",
+              "denialContext": "v0.eyJhcHBfaWQiOiIiLCJwcmluY2lwYWxfaWQiOiJhbGljZSIsInNlcnZpY2VfaWQiOiJzdmMiLCJibG9ja2VkX2ZpZWxkcyI6W3siY29vcmQiOiJDb250YWN0LnBheXJvbGwiLCJjbGFzc2lmaWNhdGlvbiI6InRhZy1yZXF1ZXN0YWJsZSIsInJlYXNvbiI6IlJlcXVlc3QgYWNjZXNzIHZpYSB0aGUgQWNjZXNzIFJlcXVlc3Qgd29ya2Zsb3cuIn1dLCJ0aW1lc3RhbXAiOiIyMDI2LTAxLTAyVDAzOjA0OjA1WiIsInJlcXVlc3RfaWQiOiIwMUFSWjNOREVLVFNWNFJSRkZRNjlHNUZBViIsInNjaGVtYV9pZCI6ImRyeS1ydW4tc2NoZW1hLXYxIn0.a2d3de62d2032939a5c08c043611d6b9b77b00a1ac755f8d914ed23d663d23fd"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
