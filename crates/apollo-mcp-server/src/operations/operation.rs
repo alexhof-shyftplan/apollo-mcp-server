@@ -1887,6 +1887,7 @@ mod tests {
                 "type": String("object"),
                 "properties": Object {
                     "id": Object {
+                        "type": String("object"),
                         "$ref": String("#/definitions/RealInputObject"),
                     },
                 },
@@ -2035,6 +2036,7 @@ mod tests {
                 "type": String("object"),
                 "properties": Object {
                     "id": Object {
+                        "type": String("string"),
                         "$ref": String("#/definitions/RealEnum"),
                     },
                 },
@@ -3267,6 +3269,7 @@ mod tests {
                 "properties": Object {
                     "filter": Object {
                         "description": String("the filter argument"),
+                        "type": String("object"),
                         "$ref": String("#/definitions/Filter"),
                     },
                 },
@@ -3972,6 +3975,7 @@ mod tests {
                         "items": Object {
                             "oneOf": Array [
                                 Object {
+                                    "type": String("object"),
                                     "$ref": String("#/definitions/RealInputObject"),
                                 },
                                 Object {
@@ -4093,7 +4097,7 @@ mod tests {
         "##);
 
         let json = to_sorted_json!(tool.input_schema);
-        insta::assert_snapshot!(serde_json::to_string_pretty(&json).unwrap(), @r###"
+        insta::assert_snapshot!(serde_json::to_string_pretty(&json).unwrap(), @r##"
         {
           "definitions": {
             "RealInputObject": {
@@ -4118,7 +4122,8 @@ mod tests {
               "items": {
                 "oneOf": [
                   {
-                    "$ref": "#/definitions/RealInputObject"
+                    "$ref": "#/definitions/RealInputObject",
+                    "type": "object"
                   },
                   {
                     "type": "null"
@@ -4130,7 +4135,7 @@ mod tests {
           },
           "type": "object"
         }
-        "###);
+        "##);
     }
 
     #[test]
@@ -4168,6 +4173,7 @@ mod tests {
                     "objects": Object {
                         "type": String("array"),
                         "items": Object {
+                            "type": String("object"),
                             "$ref": String("#/definitions/RealInputObject"),
                         },
                     },
@@ -4287,7 +4293,7 @@ mod tests {
         "##);
 
         let json = to_sorted_json!(tool.input_schema);
-        insta::assert_snapshot!(serde_json::to_string_pretty(&json).unwrap(), @r###"
+        insta::assert_snapshot!(serde_json::to_string_pretty(&json).unwrap(), @r##"
         {
           "definitions": {
             "RealInputObject": {
@@ -4310,7 +4316,8 @@ mod tests {
           "properties": {
             "objects": {
               "items": {
-                "$ref": "#/definitions/RealInputObject"
+                "$ref": "#/definitions/RealInputObject",
+                "type": "object"
               },
               "type": "array"
             }
@@ -4320,7 +4327,7 @@ mod tests {
           ],
           "type": "object"
         }
-        "###);
+        "##);
     }
 
     #[test]
