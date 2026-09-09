@@ -20,6 +20,7 @@ use crate::health::HealthCheckConfig;
 use crate::host_validation::HostValidationConfig;
 use crate::operations::{AnnotationOverrides, MutationMode, OperationSource};
 use crate::server_info::ServerInfoConfig;
+use crate::tools_config::Tools;
 
 pub(crate) mod states;
 
@@ -76,6 +77,7 @@ pub struct Server {
     server_info: ServerInfoConfig,
     config_validator: Option<ConfigValidator>,
     instructions: Option<String>,
+    tools_config: Tools,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -170,6 +172,7 @@ impl Server {
         server_info: ServerInfoConfig,
         config_validator: Option<ConfigValidator>,
         instructions: Option<String>,
+        #[builder(default)] tools_config: Tools,
     ) -> Self {
         let headers = {
             let mut headers = headers.clone();
@@ -212,6 +215,7 @@ impl Server {
             server_info,
             config_validator,
             instructions,
+            tools_config,
         }
     }
 

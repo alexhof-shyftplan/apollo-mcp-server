@@ -21,6 +21,8 @@ pub(crate) mod schema_tree_shake;
 pub mod server;
 pub mod server_info;
 pub(crate) mod telemetry_attributes;
+pub(crate) mod tiers;
+pub mod tools_config;
 
 /// These values are generated at build time by build.rs using telemetry.toml as input.
 pub mod generated {

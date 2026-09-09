@@ -10,6 +10,8 @@ use url::Url;
 
 use apollo_mcp_server::server_info::ServerInfoConfig;
 
+use apollo_mcp_server::tools_config::Tools;
+
 use super::{
     OperationSource, SchemaSource, endpoint::Endpoint, graphos::GraphOSConfig,
     introspection::Introspection, logging::Logging, overrides::Overrides, rhai::RhaiConfig,
@@ -73,6 +75,10 @@ pub struct Config {
 
     /// Overrides for server behaviour
     pub overrides: Overrides,
+
+    /// Progressive tool disclosure — bootstrap set + named tiers
+    #[serde(default)]
+    pub tools: Tools,
 
     /// The schema to load for operations
     pub schema: SchemaSource,

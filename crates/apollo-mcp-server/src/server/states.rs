@@ -18,6 +18,7 @@ use crate::{
     health::HealthCheckConfig,
     operations::{AnnotationOverrides, MutationMode},
     server_info::ServerInfoConfig,
+    tools_config::Tools,
 };
 
 use super::{ConfigValidator, Server, ServerEvent, ShutdownReason, Transport};
@@ -70,6 +71,7 @@ struct Config {
     cors: CorsConfig,
     server_info: ServerInfoConfig,
     instructions: Option<String>,
+    tools_config: Tools,
 }
 
 impl StateMachine {
@@ -127,6 +129,7 @@ impl StateMachine {
                 cors: server.cors,
                 server_info: server.server_info,
                 instructions: server.instructions,
+                tools_config: server.tools_config,
             },
         });
 
@@ -475,6 +478,8 @@ mod tests {
             search_tool: None,
             explorer_tool: None,
             validate_tool: None,
+            load_tier_tool: None,
+            bootstrap_tools: Arc::new(std::collections::HashSet::new()),
             custom_scalar_map: None,
             peers: Arc::new(RwLock::new(vec![])),
             cancellation_token: CancellationToken::new(),
@@ -531,6 +536,7 @@ mod tests {
             cors: CorsConfig::default(),
             server_info: ServerInfoConfig::default(),
             instructions: None,
+            tools_config: crate::tools_config::Tools::default(),
         }
     }
 

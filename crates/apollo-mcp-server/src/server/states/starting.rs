@@ -12,13 +12,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
 use crate::server::states::telemetry::otel_context_middleware;
+use crate::tiers::{LOAD_TIER_TOOL_NAME, LoadTier, SessionStateMap};
 use crate::{
     cors::CorsConfig,
     errors::ServerError,
-    explorer::Explorer,
+    explorer::{EXPLORER_TOOL_NAME, Explorer},
     health::HealthCheck,
     introspection::tools::{
-        execute::Execute, introspect::Introspect, search::Search, validate::Validate,
+        execute::{EXECUTE_TOOL_NAME, Execute},
+        introspect::{INTROSPECT_TOOL_NAME, Introspect},
+        search::{SEARCH_TOOL_NAME, Search},
+        validate::{VALIDATE_TOOL_NAME, Validate},
     },
     operations::{MutationMode, RawOperation},
     server::Transport,
@@ -164,6 +168,60 @@ impl Starting {
         // Move into `Running` so we do not clone the full string (`config.instructions` is not read afterward).
         let instructions = std::mem::take(&mut self.config.instructions);
 
+        // Progressive tool disclosure: validate tools config against the
+        // set of tools this server will actually serve, then build the
+        // synthetic `load_tier` tool. When neither `bootstrap` nor
+        // `tiers` are configured, filtering is skipped entirely.
+        let tools_config = std::mem::take(&mut self.config.tools_config);
+        let (load_tier_tool, bootstrap_tools) = if tools_config.is_enabled() {
+            let mut known: std::collections::HashSet<&str> = operations
+                .iter()
+                .map(|op| op.as_ref().name.as_ref())
+                .collect();
+            if execute_tool.is_some() {
+                known.insert(EXECUTE_TOOL_NAME);
+            }
+            if introspect_tool.is_some() {
+                known.insert(INTROSPECT_TOOL_NAME);
+            }
+            if search_tool.is_some() {
+                known.insert(SEARCH_TOOL_NAME);
+            }
+            if explorer_tool.is_some() {
+                known.insert(EXPLORER_TOOL_NAME);
+            }
+            if validate_tool.is_some() {
+                known.insert(VALIDATE_TOOL_NAME);
+            }
+
+            let referenced = tools_config.referenced_tool_names();
+            let missing: Vec<&&str> = referenced.difference(&known).collect();
+            if !missing.is_empty() {
+                return Err(ServerError::ToolsConfig(format!(
+                    "unknown tool name(s) in `tools.bootstrap` / `tools.tiers`: {missing:?}. \
+                     Known tools: {known:?}"
+                )));
+            }
+            if tools_config
+                .referenced_tool_names()
+                .contains(LOAD_TIER_TOOL_NAME)
+            {
+                return Err(ServerError::ToolsConfig(format!(
+                    "`{LOAD_TIER_TOOL_NAME}` is reserved and cannot appear in \
+                     `tools.bootstrap` or `tools.tiers`"
+                )));
+            }
+
+            let bootstrap: std::collections::HashSet<String> =
+                tools_config.bootstrap.iter().cloned().collect();
+            let session_state: SessionStateMap =
+                Arc::new(RwLock::new(std::collections::HashMap::new()));
+            let load_tier = LoadTier::new(tools_config.tiers, session_state);
+            (Some(load_tier), Arc::new(bootstrap))
+        } else {
+            (None, Arc::new(std::collections::HashSet::new()))
+        };
+
         let running = Running {
             schema,
             operations: Arc::new(RwLock::new(operations)),
@@ -177,6 +235,8 @@ impl Starting {
             search_tool,
             explorer_tool,
             validate_tool,
+            load_tier_tool,
+            bootstrap_tools,
             custom_scalar_map: self.config.custom_scalar_map,
             peers,
             cancellation_token: cancellation_token.clone(),
@@ -336,6 +396,7 @@ mod tests {
                 cors: Default::default(),
                 server_info: Default::default(),
                 instructions: None,
+                tools_config: crate::tools_config::Tools::default(),
             },
             schema: Schema::parse_and_validate("type Query { hello: String }", "test.graphql")
                 .expect("Valid schema"),

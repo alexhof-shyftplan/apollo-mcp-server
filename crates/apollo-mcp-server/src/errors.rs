@@ -132,6 +132,9 @@ pub enum ServerError {
 
     #[error("There was a problem parsing Rhai scripts on startup.")]
     RhaiError,
+
+    #[error("Invalid `tools` configuration: {0}")]
+    ToolsConfig(String),
 }
 
 /// An MCP tool error

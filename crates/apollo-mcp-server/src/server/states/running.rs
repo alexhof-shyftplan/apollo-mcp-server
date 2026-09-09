@@ -34,6 +34,7 @@ use crate::meter;
 use crate::operations::{execute_operation, find_and_execute_operation};
 use crate::server::states::telemetry::get_parent_span;
 use crate::server_info::ServerInfoConfig;
+use crate::tiers::{LOAD_TIER_TOOL_NAME, LoadTier, session_id_from_extensions};
 use crate::{
     custom_scalar_map::CustomScalarMap,
     errors::McpError,
@@ -64,6 +65,12 @@ pub(super) struct Running {
     pub(super) search_tool: Option<Search>,
     pub(super) explorer_tool: Option<Explorer>,
     pub(super) validate_tool: Option<Validate>,
+    /// Synthetic `load_tier` tool exposed when progressive tool
+    /// disclosure is configured. `None` disables filtering entirely.
+    pub(super) load_tier_tool: Option<LoadTier>,
+    /// Bootstrap tool names always visible before any tier is
+    /// unlocked. Only consulted when `load_tier_tool` is `Some`.
+    pub(super) bootstrap_tools: Arc<std::collections::HashSet<String>>,
     pub(super) custom_scalar_map: Option<CustomScalarMap>,
     pub(super) peers: Arc<RwLock<Vec<Peer<RoleServer>>>>,
     pub(super) cancellation_token: CancellationToken,
@@ -282,6 +289,13 @@ impl Running {
             .add(1, &[]);
 
         let app_param = extract_app_param(&extensions);
+        // Snapshot the session id before `extensions` is consumed by the
+        // app_target conversion below. Used only when progressive tool
+        // disclosure is configured.
+        let session_id = self
+            .load_tier_tool
+            .as_ref()
+            .map(|_| session_id_from_extensions(&extensions));
         let app_target = AppTarget::try_from((extensions, client_capabilities))?;
 
         // If we get the app param, we'll run in a special "app mode" where we only expose the tools for that app (+execute)
@@ -335,10 +349,30 @@ impl Running {
                     .chain(self.search_tool.as_ref().iter().map(|e| e.tool.clone()))
                     .chain(self.explorer_tool.as_ref().iter().map(|e| e.tool.clone()))
                     .chain(self.validate_tool.as_ref().iter().map(|e| e.tool.clone()))
+                    .chain(self.load_tier_tool.as_ref().iter().map(|t| t.tool.clone()))
                     .collect(),
                 meta: None,
             }
         };
+
+        // Progressive tool disclosure: when configured, hide tools that
+        // are neither in the bootstrap set nor in a tier the current
+        // session has unlocked. The synthetic `load_tier` tool always
+        // stays visible so the LLM can request more.
+        if let (Some(load_tier), Some(session_id)) =
+            (self.load_tier_tool.as_ref(), session_id.as_deref())
+        {
+            let unlocked_tools = load_tier
+                .unlocked_tool_names_for_session(session_id)
+                .await;
+            let bootstrap = self.bootstrap_tools.clone();
+            result.tools.retain(|tool| {
+                let name = tool.name.as_ref();
+                name == LOAD_TIER_TOOL_NAME
+                    || bootstrap.contains(name)
+                    || unlocked_tools.contains(name)
+            });
+        }
 
         if !self.client_supports_output_schema(protocol_version) {
             for tool in &mut result.tools {
@@ -370,6 +404,23 @@ impl Running {
                     "Invalid input: {e}"
                 ))])),
             }
+        } else if tool_name == LOAD_TIER_TOOL_NAME
+            && let Some(load_tier) = &self.load_tier_tool
+        {
+            let session_id = session_id_from_extensions(extensions);
+            let outcome = match serde_json::from_value(Value::from(request.arguments)) {
+                Ok(args) => load_tier.execute(args, session_id).await,
+                Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Invalid input: {e}"
+                ))])),
+            };
+            // Broadcast tools/list_changed so every connected peer
+            // re-fetches. Sessions whose state was not touched will
+            // re-fetch and see the same set they had before — cheap.
+            if outcome.as_ref().is_ok_and(|r| !r.is_error.unwrap_or(false)) {
+                Self::notify_tool_list_changed(self.peers.clone()).await;
+            }
+            outcome
         } else if tool_name == SEARCH_TOOL_NAME
             && let Some(search_tool) = &self.search_tool
         {
@@ -872,6 +923,8 @@ mod tests {
             search_tool: None,
             explorer_tool: None,
             validate_tool: None,
+            load_tier_tool: None,
+            bootstrap_tools: Arc::new(std::collections::HashSet::new()),
             custom_scalar_map: None,
             peers: Arc::new(RwLock::new(vec![])),
             cancellation_token: CancellationToken::new(),
@@ -2685,6 +2738,8 @@ mod integration_tests {
                 search_tool: None,
                 explorer_tool: None,
                 validate_tool: None,
+                load_tier_tool: None,
+                bootstrap_tools: Arc::new(std::collections::HashSet::new()),
                 custom_scalar_map: None,
                 peers: Arc::new(RwLock::new(vec![])),
                 cancellation_token: CancellationToken::new(),
@@ -3085,6 +3140,356 @@ mod integration_tests {
         }
     }
 
+    mod progressive_disclosure {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        use axum::body::Body;
+        use http::{Request, StatusCode};
+        use http_body_util::BodyExt;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+        use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+        use serde_json::json;
+        use tokio::sync::RwLock;
+        use tower::ServiceExt;
+
+        use super::*;
+        use crate::operations::RawOperation;
+        use crate::tiers::LoadTier;
+
+        fn operation_from_source(schema: &Valid<Schema>, src: &str) -> Operation {
+            let raw: RawOperation = (src.to_string(), None).into();
+            raw.into_operation(
+                schema,
+                None,
+                MutationMode::None,
+                false,
+                false,
+                false,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap()
+            .expect("operation should be valid")
+        }
+
+        fn create_running_with_tiers(
+            bootstrap: &[&str],
+            tiers: &[(&str, &[&str])],
+        ) -> Running {
+            let schema = apollo_compiler::Schema::parse_and_validate(
+                "type Query { auth: String people: String schedules: String absences: String }",
+                "test",
+            )
+            .unwrap();
+
+            let operations = vec![
+                operation_from_source(&schema, "query auth { auth }"),
+                operation_from_source(&schema, "query people { people }"),
+                operation_from_source(&schema, "query schedules { schedules }"),
+                operation_from_source(&schema, "query absences { absences }"),
+            ];
+
+            let bootstrap_tools: HashSet<String> =
+                bootstrap.iter().map(|s| (*s).to_string()).collect();
+            let tier_map: HashMap<String, Vec<String>> = tiers
+                .iter()
+                .map(|(name, tools)| {
+                    (
+                        (*name).to_string(),
+                        tools.iter().map(|s| (*s).to_string()).collect(),
+                    )
+                })
+                .collect();
+            let session_state = Arc::new(RwLock::new(HashMap::new()));
+            let load_tier = LoadTier::new(tier_map, session_state);
+
+            Running {
+                schema: Arc::new(RwLock::new(schema)),
+                operations: Arc::new(RwLock::new(operations)),
+                apps: vec![],
+                prompts: vec![],
+                headers: http::HeaderMap::new(),
+                forward_headers: vec![],
+                endpoint: url::Url::parse("http://localhost:4000").unwrap(),
+                execute_tool: None,
+                introspect_tool: None,
+                search_tool: None,
+                explorer_tool: None,
+                validate_tool: None,
+                load_tier_tool: Some(load_tier),
+                bootstrap_tools: Arc::new(bootstrap_tools),
+                custom_scalar_map: None,
+                peers: Arc::new(RwLock::new(vec![])),
+                cancellation_token: CancellationToken::new(),
+                mutation_mode: MutationMode::None,
+                disable_type_description: false,
+                disable_schema_description: false,
+                enable_output_schema: false,
+                disable_auth_token_passthrough: false,
+                descriptions: HashMap::new(),
+                annotations: HashMap::new(),
+                health_check: None,
+                server_info: Default::default(),
+                instructions: None,
+                rhai_engine: Arc::new(parking_lot::Mutex::new(RhaiEngine::new("rhai"))),
+            }
+        }
+
+        fn create_service(
+            running: Running,
+            session_manager: Arc<LocalSessionManager>,
+        ) -> StreamableHttpService<Running, LocalSessionManager> {
+            StreamableHttpService::new(
+                move || Ok(running.clone()),
+                session_manager,
+                StreamableHttpServerConfig::default().with_stateful_mode(true),
+            )
+        }
+
+        fn build_initialize_request() -> Request<Body> {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test-client", "version": "1.0.0" }
+                }
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Host", "localhost:8000")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+
+        fn build_notification_request(session_id: &str) -> Request<Body> {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Host", "localhost:8000")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Session-Id", session_id)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+
+        fn build_tools_list_request(session_id: &str) -> Request<Body> {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list"
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Host", "localhost:8000")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Session-Id", session_id)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+
+        fn build_load_tier_request(session_id: &str, tier: &str) -> Request<Body> {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "load_tier", "arguments": { "tier": tier } }
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("Host", "localhost:8000")
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+                .header("Mcp-Session-Id", session_id)
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+
+        fn extract_session_id<B>(response: &http::Response<B>) -> String {
+            response
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        async fn extract_json_body<B>(response: http::Response<B>) -> serde_json::Value
+        where
+            B: BodyExt,
+            B::Error: std::fmt::Debug,
+        {
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body_str = String::from_utf8_lossy(&bytes);
+            for line in body_str.lines() {
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(data)
+                {
+                    return val;
+                }
+            }
+            panic!("no JSON data found in SSE response");
+        }
+
+        async fn initialize_session(
+            running: &Running,
+            session_manager: &Arc<LocalSessionManager>,
+        ) -> String {
+            let service = create_service(running.clone(), Arc::clone(session_manager));
+            let response = service.oneshot(build_initialize_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let session_id = extract_session_id(&response);
+
+            let service = create_service(running.clone(), Arc::clone(session_manager));
+            let response = service
+                .oneshot(build_notification_request(&session_id))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            session_id
+        }
+
+        async fn tool_names(
+            running: Running,
+            session_manager: Arc<LocalSessionManager>,
+            session_id: &str,
+        ) -> Vec<String> {
+            let service = create_service(running, session_manager);
+            let response = service
+                .oneshot(build_tools_list_request(session_id))
+                .await
+                .unwrap();
+            let body = extract_json_body(response).await;
+            body["result"]["tools"]
+                .as_array()
+                .expect("tools/list should return an array")
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn bootstrap_only_visible_before_load_tier() {
+            let running = create_running_with_tiers(
+                &["auth"],
+                &[
+                    ("scheduling", &["schedules", "absences"]),
+                    ("people", &["people"]),
+                ],
+            );
+            let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
+            let session_id = initialize_session(&running, &session_manager).await;
+
+            let mut names =
+                tool_names(running, session_manager, &session_id).await;
+            names.sort();
+            assert_eq!(names, vec!["auth", "load_tier"]);
+        }
+
+        #[tokio::test]
+        async fn load_tier_unlocks_tier_tools() {
+            let running = create_running_with_tiers(
+                &["auth"],
+                &[
+                    ("scheduling", &["schedules", "absences"]),
+                    ("people", &["people"]),
+                ],
+            );
+            let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
+            let session_id = initialize_session(&running, &session_manager).await;
+
+            let service = create_service(running.clone(), Arc::clone(&session_manager));
+            let response = service
+                .oneshot(build_load_tier_request(&session_id, "scheduling"))
+                .await
+                .unwrap();
+            let body = extract_json_body(response).await;
+            assert!(
+                body["error"].is_null(),
+                "load_tier should succeed, got {body}"
+            );
+
+            let mut names =
+                tool_names(running, session_manager, &session_id).await;
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["absences", "auth", "load_tier", "schedules"]
+            );
+        }
+
+        #[tokio::test]
+        async fn tiers_are_independent_across_sessions() {
+            let running = create_running_with_tiers(
+                &["auth"],
+                &[("people", &["people"])],
+            );
+            let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
+            let session_a = initialize_session(&running, &session_manager).await;
+            let session_b = initialize_session(&running, &session_manager).await;
+
+            // Session A unlocks `people`, session B does not.
+            let service = create_service(running.clone(), Arc::clone(&session_manager));
+            let response = service
+                .oneshot(build_load_tier_request(&session_a, "people"))
+                .await
+                .unwrap();
+            let _ = extract_json_body(response).await;
+
+            let mut names_a =
+                tool_names(running.clone(), Arc::clone(&session_manager), &session_a).await;
+            names_a.sort();
+            assert_eq!(names_a, vec!["auth", "load_tier", "people"]);
+
+            let mut names_b =
+                tool_names(running, session_manager, &session_b).await;
+            names_b.sort();
+            assert_eq!(names_b, vec!["auth", "load_tier"]);
+        }
+
+        #[tokio::test]
+        async fn unknown_tier_returns_tool_error_without_unlocking() {
+            let running = create_running_with_tiers(
+                &["auth"],
+                &[("people", &["people"])],
+            );
+            let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
+            let session_id = initialize_session(&running, &session_manager).await;
+
+            let service = create_service(running.clone(), Arc::clone(&session_manager));
+            let response = service
+                .oneshot(build_load_tier_request(&session_id, "does-not-exist"))
+                .await
+                .unwrap();
+            let body = extract_json_body(response).await;
+            assert_eq!(
+                body["result"]["isError"].as_bool(),
+                Some(true),
+                "unknown tier should be reported as tool-level error; body={body}"
+            );
+
+            let mut names =
+                tool_names(running, session_manager, &session_id).await;
+            names.sort();
+            assert_eq!(names, vec!["auth", "load_tier"]);
+        }
+    }
+
     mod structured_content_gating {
         use std::sync::Arc;
 
@@ -3133,6 +3538,8 @@ mod integration_tests {
                 search_tool: None,
                 explorer_tool: None,
                 validate_tool: None,
+                load_tier_tool: None,
+                bootstrap_tools: Arc::new(std::collections::HashSet::new()),
                 custom_scalar_map: None,
                 peers: Arc::new(RwLock::new(vec![])),
                 cancellation_token: CancellationToken::new(),
@@ -3365,6 +3772,8 @@ mod integration_tests {
                 search_tool: None,
                 explorer_tool: None,
                 validate_tool: None,
+                load_tier_tool: None,
+                bootstrap_tools: Arc::new(std::collections::HashSet::new()),
                 custom_scalar_map: None,
                 peers: Arc::new(RwLock::new(vec![])),
                 cancellation_token: CancellationToken::new(),
@@ -3685,6 +4094,8 @@ mod integration_tests {
                 search_tool: None,
                 explorer_tool: None,
                 validate_tool: None,
+                load_tier_tool: None,
+                bootstrap_tools: Arc::new(std::collections::HashSet::new()),
                 custom_scalar_map: None,
                 peers: Arc::new(RwLock::new(vec![])),
                 cancellation_token: CancellationToken::new(),
@@ -3843,6 +4254,8 @@ mod integration_tests {
                 search_tool: None,
                 explorer_tool: None,
                 validate_tool: None,
+                load_tier_tool: None,
+                bootstrap_tools: Arc::new(std::collections::HashSet::new()),
                 custom_scalar_map: None,
                 peers: Arc::new(RwLock::new(vec![])),
                 cancellation_token: CancellationToken::new(),
