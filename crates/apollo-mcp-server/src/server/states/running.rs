@@ -355,10 +355,17 @@ impl Running {
             }
         };
 
-        // Progressive tool disclosure: when configured, hide tools that
-        // are neither in the bootstrap set nor in a tier the current
-        // session has unlocked. The synthetic `load_tier` tool always
-        // stays visible so the LLM can request more.
+        // Progressive tool disclosure: keep every tool visible in
+        // tools/list with its full input_schema — hiding tools or
+        // stubbing their schemas breaks hosts (e.g. Claude Desktop)
+        // that snapshot the tool palette at connect and never sync
+        // schemas from subsequent list_changed refetches. Instead,
+        // replace the description of locked-tier tools with a slim
+        // placeholder that tells the LLM exactly how to unlock the
+        // full documentation. Bootstrap tools, unlocked-tier tools,
+        // native tools, and `load_tier` itself keep their full
+        // descriptions. The input_schema is preserved for every tool
+        // so the LLM can still invoke it with meaningful arguments.
         if let (Some(load_tier), Some(session_id)) =
             (self.load_tier_tool.as_ref(), session_id.as_deref())
         {
@@ -366,12 +373,22 @@ impl Running {
                 .unlocked_tool_names_for_session(session_id)
                 .await;
             let bootstrap = self.bootstrap_tools.clone();
-            result.tools.retain(|tool| {
+            for tool in &mut result.tools {
                 let name = tool.name.as_ref();
-                name == LOAD_TIER_TOOL_NAME
+                if name == LOAD_TIER_TOOL_NAME
                     || bootstrap.contains(name)
                     || unlocked_tools.contains(name)
-            });
+                {
+                    continue;
+                }
+                let Some(tier) = load_tier.tier_for_tool(name) else {
+                    continue;
+                };
+                tool.description = Some(
+                    LoadTier::slim_description_for_locked_tier(tier, name).into(),
+                );
+                tool.output_schema = None;
+            }
         }
 
         if !self.client_supports_output_schema(protocol_version) {
@@ -739,8 +756,10 @@ impl ServerHandler for Running {
             && let Ok(json) = serde_json::to_string(args)
         {
             span.record("apollo.mcp.tool_arguments", json.as_str());
+            info!(tool = request.name.as_ref(), args = %json, "MCP tool_call");
         }
 
+        let tool_name = request.name.to_string();
         let peer_info = context.peer.peer_info();
         let protocol_version = peer_info.as_ref().map(|info| &info.protocol_version);
 
@@ -755,6 +774,13 @@ impl ServerHandler for Running {
             stripped.meta = None;
             if let Ok(json) = serde_json::to_string(&stripped) {
                 span.record("apollo.mcp.tool_result", json.as_str());
+                let preview: String = json.chars().take(500).collect();
+                info!(
+                    tool = %tool_name,
+                    is_error = r.is_error.unwrap_or(false),
+                    result_preview = %preview,
+                    "MCP tool_call result"
+                );
             }
         }
 
@@ -3383,8 +3409,33 @@ mod integration_tests {
                 .collect()
         }
 
+        async fn tools_by_name(
+            running: Running,
+            session_manager: Arc<LocalSessionManager>,
+            session_id: &str,
+        ) -> HashMap<String, serde_json::Value> {
+            let service = create_service(running, session_manager);
+            let response = service
+                .oneshot(build_tools_list_request(session_id))
+                .await
+                .unwrap();
+            let body = extract_json_body(response).await;
+            body["result"]["tools"]
+                .as_array()
+                .expect("tools/list should return an array")
+                .iter()
+                .map(|t| (t["name"].as_str().unwrap().to_string(), t.clone()))
+                .collect()
+        }
+
+        fn is_locked(tool: &serde_json::Value) -> bool {
+            tool["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("one of the tools in the") && d.contains("load_tier"))
+        }
+
         #[tokio::test]
-        async fn bootstrap_only_visible_before_load_tier() {
+        async fn all_tools_visible_but_locked_ones_are_slim_before_load_tier() {
             let running = create_running_with_tiers(
                 &["auth"],
                 &[
@@ -3395,14 +3446,32 @@ mod integration_tests {
             let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
             let session_id = initialize_session(&running, &session_manager).await;
 
-            let mut names =
-                tool_names(running, session_manager, &session_id).await;
+            let by_name = tools_by_name(running, session_manager, &session_id).await;
+            let mut names: Vec<&String> = by_name.keys().collect();
             names.sort();
-            assert_eq!(names, vec!["auth", "load_tier"]);
+            assert_eq!(
+                names,
+                vec!["absences", "auth", "load_tier", "people", "schedules"]
+            );
+
+            // Bootstrap + load_tier: full descriptions.
+            assert!(!is_locked(&by_name["auth"]), "auth should keep full desc");
+            assert!(
+                !is_locked(&by_name["load_tier"]),
+                "load_tier is never slimmed"
+            );
+            // Locked-tier tools: slim placeholder.
+            for locked in ["schedules", "absences", "people"] {
+                assert!(
+                    is_locked(&by_name[locked]),
+                    "expected `{locked}` to have slim description, got: {}",
+                    by_name[locked]["description"]
+                );
+            }
         }
 
         #[tokio::test]
-        async fn load_tier_unlocks_tier_tools() {
+        async fn load_tier_restores_full_descriptions() {
             let running = create_running_with_tiers(
                 &["auth"],
                 &[
@@ -3424,13 +3493,12 @@ mod integration_tests {
                 "load_tier should succeed, got {body}"
             );
 
-            let mut names =
-                tool_names(running, session_manager, &session_id).await;
-            names.sort();
-            assert_eq!(
-                names,
-                vec!["absences", "auth", "load_tier", "schedules"]
-            );
+            let by_name = tools_by_name(running, session_manager, &session_id).await;
+            // scheduling tier tools now have full descriptions.
+            assert!(!is_locked(&by_name["schedules"]));
+            assert!(!is_locked(&by_name["absences"]));
+            // Other tier stays locked.
+            assert!(is_locked(&by_name["people"]));
         }
 
         #[tokio::test]
@@ -3443,7 +3511,6 @@ mod integration_tests {
             let session_a = initialize_session(&running, &session_manager).await;
             let session_b = initialize_session(&running, &session_manager).await;
 
-            // Session A unlocks `people`, session B does not.
             let service = create_service(running.clone(), Arc::clone(&session_manager));
             let response = service
                 .oneshot(build_load_tier_request(&session_a, "people"))
@@ -3451,15 +3518,12 @@ mod integration_tests {
                 .unwrap();
             let _ = extract_json_body(response).await;
 
-            let mut names_a =
-                tool_names(running.clone(), Arc::clone(&session_manager), &session_a).await;
-            names_a.sort();
-            assert_eq!(names_a, vec!["auth", "load_tier", "people"]);
+            let by_name_a =
+                tools_by_name(running.clone(), Arc::clone(&session_manager), &session_a).await;
+            assert!(!is_locked(&by_name_a["people"]), "A unlocked people");
 
-            let mut names_b =
-                tool_names(running, session_manager, &session_b).await;
-            names_b.sort();
-            assert_eq!(names_b, vec!["auth", "load_tier"]);
+            let by_name_b = tools_by_name(running, session_manager, &session_b).await;
+            assert!(is_locked(&by_name_b["people"]), "B did not unlock people");
         }
 
         #[tokio::test]
@@ -3483,10 +3547,11 @@ mod integration_tests {
                 "unknown tier should be reported as tool-level error; body={body}"
             );
 
-            let mut names =
-                tool_names(running, session_manager, &session_id).await;
-            names.sort();
-            assert_eq!(names, vec!["auth", "load_tier"]);
+            let by_name = tools_by_name(running, session_manager, &session_id).await;
+            assert!(
+                is_locked(&by_name["people"]),
+                "people should remain slim after a failed load_tier"
+            );
         }
     }
 

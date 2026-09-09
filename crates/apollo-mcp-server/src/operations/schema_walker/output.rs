@@ -157,8 +157,18 @@ fn build_selection_set_schema(
 
                     properties.insert(response_key.clone(), field_schema.into());
 
-                    // Non-null fields are required in the response
-                    if field_def.ty.is_non_null() {
+                    // Non-null fields are required in the response — except
+                    // when the selection carries `@include(if: …)` or
+                    // `@skip(if: …)`. Those two directives conditionally omit
+                    // the field from the response depending on a runtime
+                    // variable, so marking the field required would make the
+                    // downstream client (Claude Desktop, VS Code Copilot, …)
+                    // reject the payload as schema-invalid whenever the
+                    // condition excludes it.
+                    let conditionally_present = field.directives.iter().any(|d| {
+                        matches!(d.name.as_str(), "include" | "skip")
+                    });
+                    if field_def.ty.is_non_null() && !conditionally_present {
                         required.push(response_key);
                     }
                 } else {
@@ -802,5 +812,139 @@ mod tests {
             !output_str.contains("email"),
             "email should be excluded from schema because it is marked @private, but got: {output_str}"
         );
+    }
+
+    #[test]
+    fn non_null_fields_with_include_directive_are_not_required() {
+        let schema = parse_schema(
+            r#"
+            type Query {
+                user(id: ID!): User
+            }
+
+            type User {
+                id: ID!
+                name: String!
+                staffNumber: String!
+                invitationState: String!
+            }
+            "#,
+        );
+
+        let (_, selection_set) = parse_operation(
+            r#"
+            query GetUser($id: ID!, $extendedInfo: Boolean = false) {
+                user(id: $id) {
+                    id
+                    name
+                    staffNumber
+                    invitationState @include(if: $extendedInfo)
+                }
+            }
+            "#,
+        );
+
+        let query_type = schema.types.get("Query").unwrap();
+        let output_schema = selection_set_to_schema(
+            &selection_set,
+            query_type,
+            &schema,
+            None,
+            &HashMap::new(),
+            None,
+        );
+
+        let required_list = required_list_for(&output_schema);
+        // The bug this test guards against: without the fix, `invitationState`
+        // ends up in the `required` list, and Claude Desktop rejects any
+        // response returned with `extendedInfo: false`.
+        assert!(
+            !required_list.contains(&"invitationState"),
+            "invitationState must NOT be required when @include-gated; required = {required_list:?}",
+        );
+        // Sibling non-null fields without a directive stay required.
+        assert!(required_list.contains(&"id"));
+        assert!(required_list.contains(&"name"));
+        assert!(required_list.contains(&"staffNumber"));
+    }
+
+    #[test]
+    fn non_null_fields_with_skip_directive_are_not_required() {
+        let schema = parse_schema(
+            r#"
+            type Query {
+                user(id: ID!): User
+            }
+
+            type User {
+                id: ID!
+                name: String!
+                staffNumber: String!
+            }
+            "#,
+        );
+
+        let (_, selection_set) = parse_operation(
+            r#"
+            query GetUser($id: ID!, $hideStaff: Boolean = false) {
+                user(id: $id) {
+                    id
+                    name
+                    staffNumber @skip(if: $hideStaff)
+                }
+            }
+            "#,
+        );
+
+        let query_type = schema.types.get("Query").unwrap();
+        let output_schema = selection_set_to_schema(
+            &selection_set,
+            query_type,
+            &schema,
+            None,
+            &HashMap::new(),
+            None,
+        );
+
+        let required_list = required_list_for(&output_schema);
+        assert!(!required_list.contains(&"staffNumber"));
+        assert!(required_list.contains(&"id"));
+        assert!(required_list.contains(&"name"));
+    }
+
+    /// Collect every string that appears anywhere in a `required` array
+    /// inside the given schema. Sufficient for the assertions above,
+    /// which only need to check presence/absence of a specific field name.
+    fn required_list_for(schema: &JSONSchema) -> Vec<&'static str> {
+        // Use static leaking to keep &'static str for concise assert! usage.
+        let v = serde_json::to_value(schema).unwrap();
+        let mut out: Vec<String> = Vec::new();
+        walk(&v, &mut out);
+        out.into_iter()
+            .map(|s| Box::leak(s.into_boxed_str()) as &'static str)
+            .collect()
+    }
+
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(serde_json::Value::Array(arr)) = m.get("required") {
+                    for x in arr {
+                        if let Some(s) = x.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+                for (_, child) in m {
+                    walk(child, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for x in arr {
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
     }
 }

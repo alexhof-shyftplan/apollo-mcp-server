@@ -61,6 +61,10 @@ pub struct Input {
 pub struct LoadTier {
     /// Config: tier name → tool names.
     tier_definitions: Arc<HashMap<String, Vec<String>>>,
+    /// Reverse index: tool name → tier name. Built once at
+    /// construction so `list_tools_impl` can look up the tier for a
+    /// tool without scanning every tier per call.
+    tool_to_tier: Arc<HashMap<String, String>>,
     /// Shared per-session unlocked-tier state.
     session_state: SessionStateMap,
     /// The MCP tool descriptor advertised on `tools/list`.
@@ -72,6 +76,12 @@ impl LoadTier {
         tier_definitions: HashMap<String, Vec<String>>,
         session_state: SessionStateMap,
     ) -> Self {
+        let mut tool_to_tier: HashMap<String, String> = HashMap::new();
+        for (tier, tools) in &tier_definitions {
+            for tool_name in tools {
+                tool_to_tier.insert(tool_name.clone(), tier.clone());
+            }
+        }
         let tool = Tool::new(
             LOAD_TIER_TOOL_NAME,
             build_description(&tier_definitions),
@@ -79,9 +89,16 @@ impl LoadTier {
         );
         Self {
             tier_definitions: Arc::new(tier_definitions),
+            tool_to_tier: Arc::new(tool_to_tier),
             session_state,
             tool,
         }
+    }
+
+    /// The tier that owns `tool_name`, if any. Returns `None` for
+    /// bootstrap tools, native tools, and unknown names.
+    pub fn tier_for_tool(&self, tool_name: &str) -> Option<&str> {
+        self.tool_to_tier.get(tool_name).map(String::as_str)
     }
 
     /// Mark `tier` as unlocked in the given session. Returns the list
@@ -115,14 +132,24 @@ impl LoadTier {
 
         // Also emit a human-readable one-liner so hosts that only
         // render text see something meaningful in the transcript.
+        // Every tier tool was already visible in `tools/list` with a
+        // slim placeholder description; the LLM's job is to refresh
+        // its palette (auto on `list_changed`-aware hosts, via
+        // `tool_search` on Claude Desktop) so the full descriptions
+        // and input schemas replace the placeholders.
         let message = if already_unlocked {
             format!("Tier {tier_name:?} was already unlocked in this session.")
         } else {
             format!(
-                "Unlocked tier {tier_name:?}. {n} tool(s) now available: {tools:?}. \
-                 Re-fetch tools/list to see them.",
+                "Unlocked tier {tier_name:?} for this session. {n} tool(s) now carry \
+                 their full descriptions and input schemas: {tools:?}. IMPORTANT next \
+                 step: refresh your tool palette so the swap propagates — on Claude \
+                 Desktop that means running `tool_search(\"{tier_name}\")`; hosts that \
+                 auto-refresh on tools/list_changed can skip it. Then invoke the tool \
+                 the user's request actually needs.",
                 n = tools.len(),
                 tools = tools,
+                tier_name = tier_name,
             )
         };
 
@@ -147,6 +174,24 @@ impl LoadTier {
         }
         out
     }
+
+    /// Slim placeholder description shown for a tool whose tier the
+    /// current session has not unlocked yet. Keeps `tools/list` lean
+    /// on cold start while telling the LLM exactly how to expand the
+    /// full description. The tool's `inputSchema` is NOT slimmed —
+    /// it stays full so hosts that snapshot the tool palette at
+    /// connect (Claude Desktop) can still invoke the tool with
+    /// meaningful arguments before `load_tier` is called.
+    pub fn slim_description_for_locked_tier(tier: &str, tool_name: &str) -> String {
+        format!(
+            "`{tool_name}` is one of the tools in the `{tier}` domain. Its arguments \
+             are already documented in this schema, but the full description of what \
+             it does, when to use it, and how it composes with sibling tools is only \
+             expanded after the session calls `load_tier(tier: \"{tier}\")`. Prefer \
+             calling `load_tier` first when the user's request implies this domain, \
+             so you can compare tools before invoking one."
+        )
+    }
 }
 
 fn build_description(tier_definitions: &HashMap<String, Vec<String>>) -> String {
@@ -158,17 +203,24 @@ fn build_description(tier_definitions: &HashMap<String, Vec<String>>) -> String 
     let mut tier_names: Vec<&String> = tier_definitions.keys().collect();
     tier_names.sort();
     let mut out = String::from(
-        "Unlock a tier of tools mid-session. Call this once you know which domain the \
-         user's request needs, and the server will make that tier's tools visible on \
-         the next `tools/list` fetch. Available tiers:\n",
+        "Domain tools always appear in tools/list, but the ones outside the \
+         session's currently-unlocked tiers are advertised with a slim placeholder \
+         description and empty input schema until you call this tool. Call \
+         `load_tier(tier: \"<name>\")` the moment the user's request implies a \
+         domain — do not ask the user first, do not narrate the step. Available \
+         tiers:\n",
     );
     for tier in tier_names {
         let count = tier_definitions.get(tier).map(Vec::len).unwrap_or(0);
         out.push_str(&format!("- `{tier}` ({count} tools)\n"));
     }
     out.push_str(
-        "\nUnlocked tiers stay unlocked for the rest of the session. \
-         Loading a tier twice is a safe no-op.",
+        "\nThe response you receive from this tool includes an explicit next-step \
+         instruction; follow it exactly (typically it tells you to refresh your \
+         palette via `tool_search` on Claude Desktop so the newly-expanded \
+         descriptions and schemas are visible to the model).\n\n\
+         Unlocked tiers stay unlocked for the rest of the session. Loading a tier \
+         twice is a safe no-op.",
     );
     out
 }

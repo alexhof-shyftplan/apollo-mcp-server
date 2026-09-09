@@ -370,6 +370,50 @@ impl graphql::Executable for Operation {
     }
 
     fn variables(&self, input_variables: Value) -> Result<Value, ValidationError> {
+        // Strip explicit-null variables so the operation's default
+        // values apply. LLM clients (e.g. Claude Desktop) tend to
+        // serialise every optional field on the tool's input schema,
+        // filling omitted ones with `null`. GraphQL execution treats
+        // explicit `null` as OVERRIDING the default, which breaks
+        // `@include(if: $flag)` gates (Boolean! required, cannot be
+        // null) and any non-nullable input variable with a default.
+        // The empty case (client fills every optional field with
+        // null) now matches "field omitted", which is what the LLM
+        // actually meant.
+        //
+        // Also strip the STRING literal `"null"`. Observed behaviour:
+        // Claude Desktop serialises a JSON `null` argument as the
+        // string `"null"` on the wire before it reaches this server,
+        // so a Boolean/Int/etc. variable receives the string `"null"`
+        // and GraphQL rejects with a type-coercion error. Treating
+        // the literal 4-character string `"null"` as "field omitted"
+        // matches what the LLM meant to send.
+        //
+        // Tradeoff: an LLM that legitimately wants to search for the
+        // literal 4-character string "null" (e.g. `search: "null"`)
+        // now loses that filter — but that scenario is vanishingly
+        // rare in LLM-driven tool use, and the client-side wrapping
+        // it fixes is common enough to justify the swap. Longer
+        // strings that contain "null" (`"nullable"`, `"annulled"`,
+        // …) are untouched.
+        let input_variables = match input_variables {
+            Value::Object(mut obj) => {
+                obj.retain(|_, v| {
+                    if v.is_null() {
+                        return false;
+                    }
+                    if let Some(s) = v.as_str()
+                        && s == "null"
+                    {
+                        return false;
+                    }
+                    true
+                });
+                Value::Object(obj)
+            }
+            other => other,
+        };
+
         if let Some(raw_variables) = self.inner.variables.as_ref() {
             let mut variables = match input_variables {
                 Value::Null => Ok(serde_json::Map::new()),
@@ -4777,6 +4821,89 @@ mod tests {
           "properties": {}
         }
         "#);
+    }
+
+    fn build_operation_with_variables(source_text: &str) -> Operation {
+        Operation::from_raw(
+            RawOperation {
+                source_text: source_text.to_string(),
+                headers: None,
+                variables: None,
+                source_path: None,
+            },
+            &SCHEMA,
+            None,
+            MutationMode::None,
+            false,
+            false,
+            true,
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn variables_strips_explicit_null_so_defaults_apply() {
+        let op = build_operation_with_variables(
+            "query Q($flag: Boolean = false, $name: String) { customQuery(id: \"x\", flag: $flag) { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "flag": null, "name": null }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({}));
+    }
+
+    #[test]
+    fn variables_preserves_non_null_values() {
+        let op = build_operation_with_variables(
+            "query Q($flag: Boolean = false, $name: String) { customQuery(id: \"x\", flag: $flag) { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "flag": true, "name": "alex" }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "flag": true, "name": "alex" }));
+    }
+
+    #[test]
+    fn variables_strips_null_and_keeps_non_null_in_same_call() {
+        let op = build_operation_with_variables(
+            "query Q($flag: Boolean = false, $name: String) { customQuery(id: \"x\", flag: $flag) { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "flag": true, "name": null }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "flag": true }));
+    }
+
+    #[test]
+    fn variables_strips_stringified_null_from_llm_client() {
+        // Claude Desktop has been observed to serialise a JSON `null`
+        // argument as the string "null" on the wire. Treat that
+        // artifact the same as a JSON null so the operation's default
+        // still applies.
+        let op = build_operation_with_variables(
+            "query Q($flag: Boolean = false, $name: String) { customQuery(id: \"x\", flag: $flag) { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "flag": "null", "name": "alex" }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "name": "alex" }));
+    }
+
+    #[test]
+    fn variables_preserves_legitimate_null_string_values() {
+        // Sanity: the strip only affects the literal 4-character
+        // string "null". Other strings — including strings CONTAINING
+        // "null" — must pass through untouched.
+        let op = build_operation_with_variables(
+            "query Q($flag: Boolean = false, $name: String) { customQuery(id: \"x\", flag: $flag) { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "name": "nullable" }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "name": "nullable" }));
     }
 
     #[test]
