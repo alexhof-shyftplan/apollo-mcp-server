@@ -409,6 +409,37 @@ impl graphql::Executable for Operation {
                     }
                     true
                 });
+                // Parse a stringified JSON object / array back into its
+                // structured form. Observed behaviour: LLM clients
+                // (Claude Desktop was the specific report) sometimes
+                // JSON-stringify a nested Input-typed argument before
+                // handing it to the tool call, so a variable like
+                // `employmentsPosition: EmploymentsPositionInput!`
+                // arrives on the wire as the string
+                //   "{\"employmentId\":42,\"locationsPositionId\":7}"
+                // and GraphQL rejects with
+                //   "Expected type EmploymentsPositionInput to be an object".
+                //
+                // Only strings whose trimmed first byte is `{` or `[`
+                // are candidates — so a legitimate string that just
+                // happens to contain a brace ("hello {world}") is
+                // untouched, and any scalar (Int/Boolean/etc.)
+                // variable spelled as a string is left for the
+                // downstream schema to type-check normally. If
+                // `serde_json::from_str` fails to yield an object or
+                // array, the original string is kept.
+                for value in obj.values_mut() {
+                    if let Some(s) = value.as_str() {
+                        let trimmed = s.trim_start();
+                        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                                if parsed.is_object() || parsed.is_array() {
+                                    *value = parsed;
+                                }
+                            }
+                        }
+                    }
+                }
                 Value::Object(obj)
             }
             other => other,
@@ -4904,6 +4935,74 @@ mod tests {
             .variables(serde_json::json!({ "name": "nullable" }))
             .unwrap();
         assert_eq!(out, serde_json::json!({ "name": "nullable" }));
+    }
+
+    #[test]
+    fn variables_parses_stringified_object_from_llm_client() {
+        // LLM clients (Claude Desktop was the specific report) have
+        // been observed to JSON-stringify a nested Input-typed
+        // argument before handing it to the tool call. The value
+        // arrives on the wire as a string; graphql-tools rejects with
+        // "Expected type <Input> to be an object". Parsing the string
+        // back into its structured form recovers the intended shape.
+        let op = build_operation_with_variables(
+            "query Q($name: String) { customQuery(id: \"x\") { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({
+                "name": "{\"employmentId\":42,\"locationsPositionId\":7}"
+            }))
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "name": { "employmentId": 42, "locationsPositionId": 7 }
+            })
+        );
+    }
+
+    #[test]
+    fn variables_parses_stringified_array_from_llm_client() {
+        // Same handling for a stringified list of scalars — arrives
+        // as `"[1,2,3]"` and needs to be `[1, 2, 3]` for GraphQL to
+        // coerce it to `[Int!]`.
+        let op = build_operation_with_variables(
+            "query Q($name: String) { customQuery(id: \"x\") { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "name": "[1,2,3]" }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "name": [1, 2, 3] }));
+    }
+
+    #[test]
+    fn variables_preserves_string_with_leading_brace_that_is_not_valid_json() {
+        // A legitimate string that happens to start with `{` but
+        // isn't valid JSON must pass through untouched — parse
+        // failure means "the caller meant the string, keep it".
+        let op = build_operation_with_variables(
+            "query Q($name: String) { customQuery(id: \"x\") { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "name": "{hello world" }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "name": "{hello world" }));
+    }
+
+    #[test]
+    fn variables_preserves_stringified_json_scalar_values() {
+        // `"true"`, `"42"`, `"\"foo\""` all parse as valid JSON but
+        // as SCALARS, not object / array. The caller most likely
+        // meant them as scalars-wrapped-in-strings and the downstream
+        // GraphQL layer already handles that coercion path. Only
+        // structural JSON (object / array) triggers the rewrite.
+        let op = build_operation_with_variables(
+            "query Q($name: String) { customQuery(id: \"x\") { id } }",
+        );
+        let out = op
+            .variables(serde_json::json!({ "name": "42" }))
+            .unwrap();
+        assert_eq!(out, serde_json::json!({ "name": "42" }));
     }
 
     #[test]
