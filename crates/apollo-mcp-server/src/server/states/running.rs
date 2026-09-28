@@ -23,7 +23,7 @@ use rmcp::{
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{Instrument, debug, error, info};
 use url::Url;
 
 use crate::apps::app::AppTarget;
@@ -32,7 +32,7 @@ use crate::apps::tool::{attach_tool_metadata, find_and_execute_app_tool, make_to
 use crate::generated::telemetry::{TelemetryAttribute, TelemetryMetric};
 use crate::meter;
 use crate::operations::{execute_operation, find_and_execute_operation};
-use crate::server::states::telemetry::get_parent_span;
+use crate::server::states::telemetry::{get_parent_span, set_stdio_trace_parent};
 use crate::server_info::ServerInfoConfig;
 use crate::tiers::{LOAD_TIER_TOOL_NAME, LoadTier, session_id_from_extensions};
 use crate::{
@@ -745,46 +745,58 @@ impl ServerHandler for Running {
         Ok(info)
     }
 
-    #[tracing::instrument(skip_all, parent = get_parent_span(&context), fields(apollo.mcp.tool_name = request.name.as_ref(), apollo.mcp.request_id = %context.id.clone(), apollo.mcp.tool_arguments = tracing::field::Empty, apollo.mcp.tool_result = tracing::field::Empty))]
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let span = tracing::Span::current();
-        if let Some(args) = &request.arguments
-            && let Ok(json) = serde_json::to_string(args)
-        {
-            span.record("apollo.mcp.tool_arguments", json.as_str());
-            info!(tool = request.name.as_ref(), args = %json, "MCP tool_call");
-        }
-
-        let tool_name = request.name.to_string();
-        let peer_info = context.peer.peer_info();
-        let protocol_version = peer_info.as_ref().map(|info| &info.protocol_version);
-
-        let result = self
-            .call_tool_impl(request, &context.extensions, protocol_version)
-            .await;
-
-        // Strip meta before serializing: _meta.structuredContent holds the unfiltered
-        // @private payload and must not be exported to the span.
-        if let Ok(r) = &result {
-            let mut stripped = r.clone();
-            stripped.meta = None;
-            if let Ok(json) = serde_json::to_string(&stripped) {
-                span.record("apollo.mcp.tool_result", json.as_str());
-                let preview: String = json.chars().take(500).collect();
-                info!(
-                    tool = %tool_name,
-                    is_error = r.is_error.unwrap_or(false),
-                    result_preview = %preview,
-                    "MCP tool_call result"
-                );
+        let span = tracing::info_span!(
+            parent: get_parent_span(&context),
+            "call_tool",
+            apollo.mcp.tool_name = request.name.as_ref(),
+            apollo.mcp.request_id = %context.id,
+            apollo.mcp.tool_arguments = tracing::field::Empty,
+            apollo.mcp.tool_result = tracing::field::Empty,
+        );
+        set_stdio_trace_parent(&span, &context.meta, &context.extensions);
+        async {
+            let span = tracing::Span::current();
+            if let Some(args) = &request.arguments
+                && let Ok(json) = serde_json::to_string(args)
+            {
+                span.record("apollo.mcp.tool_arguments", json.as_str());
+                info!(tool = request.name.as_ref(), args = %json, "MCP tool_call");
             }
-        }
 
-        result
+            let tool_name = request.name.to_string();
+            let peer_info = context.peer.peer_info();
+            let protocol_version = peer_info.as_ref().map(|info| &info.protocol_version);
+
+            let result = self
+                .call_tool_impl(request, &context.extensions, protocol_version)
+                .await;
+
+            // Strip meta before serializing: _meta.structuredContent holds the unfiltered
+            // @private payload and must not be exported to the span.
+            if let Ok(r) = &result {
+                let mut stripped = r.clone();
+                stripped.meta = None;
+                if let Ok(json) = serde_json::to_string(&stripped) {
+                    span.record("apollo.mcp.tool_result", json.as_str());
+                    let preview: String = json.chars().take(500).collect();
+                    info!(
+                        tool = %tool_name,
+                        is_error = r.is_error.unwrap_or(false),
+                        result_preview = %preview,
+                        "MCP tool_call result"
+                    );
+                }
+            }
+
+            result
+        }
+        .instrument(span)
+        .await
     }
 
     #[tracing::instrument(skip_all, parent = get_parent_span(&context))]

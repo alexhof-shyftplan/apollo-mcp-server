@@ -2,9 +2,11 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use opentelemetry::global;
-use opentelemetry::propagation::Extractor;
+use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry::trace::{TraceContextExt, TraceId};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use rmcp::RoleServer;
+use rmcp::model::{Extensions, Meta};
 use rmcp::service::RequestContext;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -67,6 +69,24 @@ pub fn get_parent_span(context: &RequestContext<RoleServer>) -> tracing::Span {
         .unwrap_or_else(tracing::Span::none)
 }
 
+pub fn set_stdio_trace_parent(span: &tracing::Span, meta: &Meta, extensions: &Extensions) {
+    if extensions.get::<axum::http::request::Parts>().is_some() {
+        return;
+    }
+    let Some(traceparent) = meta.get("traceparent").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    if traceparent.len() != 55 || !traceparent.starts_with("00-") {
+        return;
+    }
+    let carrier = std::collections::HashMap::from([("traceparent".into(), traceparent.to_owned())]);
+    let parent = TraceContextPropagator::new()
+        .extract_with_context(&opentelemetry::Context::new(), &carrier);
+    if parent.span().span_context().is_valid() {
+        let _ = span.set_parent(parent);
+    }
+}
+
 /// Returns the current OpenTelemetry trace ID as a lowercase 32-character
 /// hex string, or an empty string when no trace context is active.
 ///
@@ -98,6 +118,100 @@ mod tests {
     use tracing_opentelemetry::OpenTelemetryLayer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::registry;
+
+    #[test]
+    fn stdio_parent_preserves_trace_and_parent_without_private_metadata() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = registry().with(OpenTelemetryLayer::new(provider.tracer("test")));
+        let meta = serde_json::from_value(serde_json::json!({
+            "traceparent": "00-6aba98d900000000551e790072b15a08-0011223344556677-01",
+            "tracestate": "vendor=private",
+            "baggage": "private=value",
+            "authtoken": "private-token"
+        }))
+        .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("tool_call");
+            set_stdio_trace_parent(&span, &meta, &Extensions::default());
+            let context = span.context();
+            let context_span = context.span();
+            let span_context = context_span.span_context();
+            assert_eq!(
+                span_context.trace_id().to_string(),
+                "6aba98d900000000551e790072b15a08"
+            );
+            assert!(span_context.is_sampled());
+            assert!(span_context.trace_state().header().is_empty());
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].parent_span_id.to_string(), "0011223344556677");
+        for sentinel in ["vendor=private", "private=value", "private-token"] {
+            assert!(!format!("{spans:?}").contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn stdio_parent_preserves_unsampled_decision() {
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = registry().with(OpenTelemetryLayer::new(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("tool_call");
+            let meta = serde_json::from_value(serde_json::json!({
+                "traceparent": "00-6aba98d900000000551e790072b15a08-0011223344556677-00"
+            }))
+            .unwrap();
+            set_stdio_trace_parent(&span, &meta, &Extensions::default());
+            let context = span.context();
+            assert_eq!(
+                context.span().span_context().trace_id().to_string(),
+                "6aba98d900000000551e790072b15a08"
+            );
+            assert!(!context.span().span_context().is_sampled());
+        });
+    }
+
+    #[rstest::rstest]
+    #[case(serde_json::json!({}))]
+    #[case(serde_json::json!({"traceparent": 42}))]
+    #[case(serde_json::json!({"traceparent": "invalid"}))]
+    #[case(serde_json::json!({"traceparent": "00-00000000000000000000000000000000-0011223344556677-01"}))]
+    #[case(serde_json::json!({"traceparent": "00-6aba98d900000000551e790072b15a08-0000000000000000-01"}))]
+    #[case(serde_json::json!({"traceparent": "00-6aba98d900000000551e790072b15a08-0011223344556677-zz"}))]
+    #[case(serde_json::json!({"traceparent": "01-6aba98d900000000551e790072b15a08-0011223344556677-01"}))]
+    fn invalid_stdio_parent_leaves_current_trace_unchanged(#[case] metadata: serde_json::Value) {
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = registry().with(OpenTelemetryLayer::new(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("tool_call");
+            let before = span.context().span().span_context().clone();
+            let meta = serde_json::from_value(metadata).unwrap();
+            set_stdio_trace_parent(&span, &meta, &Extensions::default());
+            assert_eq!(span.context().span().span_context(), &before);
+        });
+    }
+
+    #[test]
+    fn stdio_metadata_cannot_override_http_parent() {
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = registry().with(OpenTelemetryLayer::new(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http_tool_call");
+            let before = span.context().span().span_context().clone();
+            let (parts, _) = Request::new(()).into_parts();
+            let mut extensions = Extensions::default();
+            extensions.insert(parts);
+            let meta = serde_json::from_value(serde_json::json!({
+                "traceparent": "00-6aba98d900000000551e790072b15a08-0011223344556677-01"
+            }))
+            .unwrap();
+            set_stdio_trace_parent(&span, &meta, &extensions);
+            assert_eq!(span.context().span().span_context(), &before);
+        });
+    }
 
     #[tokio::test()]
     async fn middleware_stores_span_context_and_handler_works() {
