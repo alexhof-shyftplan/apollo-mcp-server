@@ -45,9 +45,7 @@ impl From<Name<'_>> for JSONSchema {
             "Boolean" => json_schema!({"type": "boolean"}),
 
             // If we've already cached it, then return the reference immediately
-            cached if cache.contains_key(cached) => {
-                JSONSchema::new_ref(format!("#/definitions/{cached}"))
-            }
+            cached if cache.contains_key(cached) => typed_reference(cached, cache),
 
             // Otherwise generate the dependent type
             other => match schema.types.get(other) {
@@ -204,7 +202,7 @@ impl From<Name<'_>> for JSONSchema {
                         );
                     }
 
-                    JSONSchema::new_ref(format!("#/definitions/{other}"))
+                    typed_reference(other, cache)
                 }
 
                 // Anything else is unhandled
@@ -219,10 +217,48 @@ impl From<Name<'_>> for JSONSchema {
     }
 }
 
+fn typed_reference(name: &str, cache: &Map<String, Value>) -> JSONSchema {
+    let mut reference = JSONSchema::new_ref(format!("#/definitions/{name}"));
+    if let Some(declared_type) = cache.get(name).and_then(|schema| schema.get("type")) {
+        reference
+            .ensure_object()
+            .insert("type".to_string(), declared_type.clone());
+    }
+    reference
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mapped_scalar_reference_keeps_type_without_imposing_a_date_format() {
+        use std::str::FromStr;
+        let schema = GraphQLSchema::parse_and_validate(
+            "scalar Date type Query { date: Date }",
+            "schema.graphql",
+        )
+        .unwrap()
+        .into_inner();
+        let mapping = CustomScalarMap::from_str(r#"{"Date":{"type":"string"}}"#).unwrap();
+        let name = GraphQLName::new("Date").unwrap();
+        let mut cache = Map::new();
+        for _ in 0..2 {
+            let result: JSONSchema = Name {
+                cache: &mut cache,
+                custom_scalar_map: Some(&mapping),
+                description: &None,
+                name: &name,
+                schema: &schema,
+            }
+            .into();
+            assert_eq!(
+                json!(result),
+                json!({"type":"string","$ref":"#/definitions/Date"})
+            );
+        }
+    }
 
     fn builtin_type_schema(type_name: &str) -> JSONSchema {
         let schema =

@@ -355,6 +355,14 @@ impl Running {
             }
         };
 
+        for tool in &mut result.tools {
+            if tool.name.as_ref() == LOAD_TIER_TOOL_NAME
+                && let Some(overrides) = self.annotations.get(LOAD_TIER_TOOL_NAME)
+            {
+                overrides.apply_to(tool.annotations.get_or_insert_with(Default::default));
+            }
+        }
+
         // Progressive tool disclosure: keep every tool visible in
         // tools/list with its full input_schema — hiding tools or
         // stubbing their schemas breaks hosts (e.g. Claude Desktop)
@@ -369,9 +377,7 @@ impl Running {
         if let (Some(load_tier), Some(session_id)) =
             (self.load_tier_tool.as_ref(), session_id.as_deref())
         {
-            let unlocked_tools = load_tier
-                .unlocked_tool_names_for_session(session_id)
-                .await;
+            let unlocked_tools = load_tier.unlocked_tool_names_for_session(session_id).await;
             let bootstrap = self.bootstrap_tools.clone();
             for tool in &mut result.tools {
                 let name = tool.name.as_ref();
@@ -385,7 +391,12 @@ impl Running {
                     continue;
                 };
                 tool.description = Some(
-                    LoadTier::slim_description_for_locked_tier(tier, name).into(),
+                    LoadTier::slim_description_for_locked_tier(
+                        tier,
+                        name,
+                        tool.description.as_deref(),
+                    )
+                    .into(),
                 );
                 tool.output_schema = None;
             }
@@ -3211,10 +3222,7 @@ mod integration_tests {
             .expect("operation should be valid")
         }
 
-        fn create_running_with_tiers(
-            bootstrap: &[&str],
-            tiers: &[(&str, &[&str])],
-        ) -> Running {
+        fn create_running_with_tiers(bootstrap: &[&str], tiers: &[(&str, &[&str])]) -> Running {
             let schema = apollo_compiler::Schema::parse_and_validate(
                 "type Query { auth: String people: String schedules: String absences: String }",
                 "test",
@@ -3447,6 +3455,26 @@ mod integration_tests {
         }
 
         #[tokio::test]
+        async fn load_tier_uses_the_configured_title() {
+            let mut running =
+                create_running_with_tiers(&["auth"], &[("scheduling", &["schedules"])]);
+            running.annotations.insert(
+                LOAD_TIER_TOOL_NAME.to_string(),
+                AnnotationOverrides {
+                    title: Some("Load additional tools".to_string()),
+                    ..Default::default()
+                },
+            );
+            let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
+            let session_id = initialize_session(&running, &session_manager).await;
+            let tools = tools_by_name(running, session_manager, &session_id).await;
+            assert_eq!(
+                tools["load_tier"]["annotations"]["title"],
+                "Load additional tools"
+            );
+        }
+
+        #[tokio::test]
         async fn all_tools_visible_but_locked_ones_are_slim_before_load_tier() {
             let running = create_running_with_tiers(
                 &["auth"],
@@ -3515,10 +3543,7 @@ mod integration_tests {
 
         #[tokio::test]
         async fn tiers_are_independent_across_sessions() {
-            let running = create_running_with_tiers(
-                &["auth"],
-                &[("people", &["people"])],
-            );
+            let running = create_running_with_tiers(&["auth"], &[("people", &["people"])]);
             let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
             let session_a = initialize_session(&running, &session_manager).await;
             let session_b = initialize_session(&running, &session_manager).await;
@@ -3540,10 +3565,7 @@ mod integration_tests {
 
         #[tokio::test]
         async fn unknown_tier_returns_tool_error_without_unlocking() {
-            let running = create_running_with_tiers(
-                &["auth"],
-                &[("people", &["people"])],
-            );
+            let running = create_running_with_tiers(&["auth"], &[("people", &["people"])]);
             let session_manager: Arc<LocalSessionManager> = LocalSessionManager::default().into();
             let session_id = initialize_session(&running, &session_manager).await;
 

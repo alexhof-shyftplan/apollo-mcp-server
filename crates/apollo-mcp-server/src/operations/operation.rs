@@ -431,12 +431,11 @@ impl graphql::Executable for Operation {
                 for value in obj.values_mut() {
                     if let Some(s) = value.as_str() {
                         let trimmed = s.trim_start();
-                        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                                if parsed.is_object() || parsed.is_array() {
-                                    *value = parsed;
-                                }
-                            }
+                        if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                            && let Ok(parsed) = serde_json::from_str::<Value>(s)
+                            && (parsed.is_object() || parsed.is_array())
+                        {
+                            *value = parsed;
                         }
                     }
                 }
@@ -2812,6 +2811,7 @@ mod tests {
                 "type": String("object"),
                 "properties": Object {
                     "id": Object {
+                        "type": String("string"),
                         "$ref": String("#/definitions/RealCustomScalar"),
                     },
                 },
@@ -4999,9 +4999,7 @@ mod tests {
         let op = build_operation_with_variables(
             "query Q($name: String) { customQuery(id: \"x\") { id } }",
         );
-        let out = op
-            .variables(serde_json::json!({ "name": "42" }))
-            .unwrap();
+        let out = op.variables(serde_json::json!({ "name": "42" })).unwrap();
         assert_eq!(out, serde_json::json!({ "name": "42" }));
     }
 
